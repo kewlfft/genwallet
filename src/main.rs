@@ -2,6 +2,7 @@ use bip39::Mnemonic;
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use rand_chacha::ChaCha20Rng;
 use rand::{RngCore, SeedableRng};
+use bip32::XPrv;
 
 
 use rayon::prelude::*;
@@ -46,7 +47,18 @@ impl SimpleWallet {
     
     fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, Box<dyn std::error::Error>> {
         let seed = mnemonic.to_seed("");
-        let private_key = SecretKey::from_byte_array(seed[..32].try_into()?)?;
+        // Use BIP32 derivation: m/44'/60'/0'/0/0 (Ethereum standard)
+        let mut xprv = XPrv::new(&seed)?;
+        
+        // Derive each child number in the path manually
+        // m/44'/60'/0'/0/0
+        xprv = xprv.derive_child(bip32::ChildNumber::new(44, true)?)?; // 44'
+        xprv = xprv.derive_child(bip32::ChildNumber::new(60, true)?)?; // 60'
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, true)?)?;  // 0'
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
+        
+        let private_key = SecretKey::from_byte_array(xprv.to_bytes())?;
         Ok(Self::new(private_key))
     }
     

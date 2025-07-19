@@ -7,6 +7,7 @@ edition = "2021"
 # Core cryptography - ultra minimal dependencies
 secp256k1 = "0.31"
 bip39 = "2.2"
+bip32 = "0.5.3"
 
 # Random number generation
 rand = { version = "0.9", features = ["std"] }
