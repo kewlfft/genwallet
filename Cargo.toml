@@ -8,8 +8,9 @@ edition = "2021"
 [dependencies]
 ethers = "2.0"
 bip39 = "2.0"
-rand = { version = "0.8", features = ["std"] }
+rand = { version = "0.8", features = ["std", "getrandom"] }
 rand_chacha = "0.3"
+getrandom = { version = "0.2", features = ["std"] }
 rayon = "1.5"
 hex = "0.4"
 num_cpus = "1.13"

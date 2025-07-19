@@ -1,16 +1,9 @@
-// Add this to Cargo.toml dependencies as well:
-// rpassword = "7.0"
-// tokio = { version = "1", features = ["full"] }
-// serde_json = "1.0"
-// crossbeam = "0.8"
-// chrono = "0.4"
-
-use bip39::Mnemonic;
 use ethers::signers::{Signer, Wallet};
 use ethers::core::k256::ecdsa::SigningKey;
 use eth_keystore::encrypt_key;
 use rand_chacha::ChaCha20Rng;
-use rand::{SeedableRng, thread_rng};
+use rand::{SeedableRng, thread_rng, RngCore};
+use getrandom::getrandom;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -102,6 +95,30 @@ fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
         .collect()
 }
 
+fn create_hardware_rng() -> ChaCha20Rng {
+    // Use hardware entropy for seeding
+    let mut seed = [0u8; 32];
+    getrandom(&mut seed).expect("Failed to get hardware entropy");
+    ChaCha20Rng::from_seed(seed)
+}
+
+fn generate_random_password(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                             abcdefghijklmnopqrstuvwxyz\
+                             0123456789";
+    let mut rng = create_hardware_rng();
+    
+    // Use a Vec<u8> and from_utf8_unchecked for speed
+    let mut password = Vec::with_capacity(len);
+    for _ in 0..len {
+        let idx = (rng.next_u32() as usize) % CHARSET.len();
+        password.push(CHARSET[idx]);
+    }
+    
+    // Safety: CHARSET only contains valid ASCII chars
+    unsafe { String::from_utf8_unchecked(password) }
+}
+
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
     // Stack-based nybble array - no heap allocation!
     let mut addr_nybbles = [0u8; 40];
@@ -148,7 +165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if args.ask_password {
         prompt_password("Enter password to encrypt wallets: ")?
     } else {
-        "default_password".to_string()
+        let random_password = generate_random_password(16);
+        println!("Generated random password: {}", random_password);
+        random_password
     };
 
     println!(
@@ -162,8 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let progress_interval = 100_000; // Update progress every 100k attempts
 
-    (0..thread_count).into_par_iter().enumerate().for_each_with((sender, total_attempts.clone()), |(s, attempts), (thread_id, _)| {
-        let mut rng = ChaCha20Rng::seed_from_u64(thread_id as u64);
+    (0..thread_count).into_par_iter().enumerate().for_each_with((sender, total_attempts.clone()), |(s, attempts), (_thread_id, _)| {
+        let mut rng = create_hardware_rng();
 
         while found_count.load(Ordering::Acquire) < args.count {
             let wallet = Wallet::new(&mut rng);
@@ -211,13 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
                 let addr_hex = hex::encode(addr_bytes);
-                    let private_key_bytes = wallet.signer().to_bytes();
-                    let mnemonic = match Mnemonic::from_entropy(&private_key_bytes.as_slice()[..16]) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+                let private_key_bytes = wallet.signer().to_bytes();
 
-                    let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                let idx = found_count.fetch_add(1, Ordering::AcqRel);
                 if idx < args.count {
                         match save_encrypted_wallet(&wallet, &password, &args.output_dir) {
                             Ok(path) => {
@@ -229,11 +244,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 println!("PrivateKey: {}", redact_private_key(&hex::encode(private_key_bytes.as_slice())));
                             }
-                            println!("Mnemonic:   {}", mnemonic.to_string());
                             println!("Saved to:   {}", path);
                             println!("---");
                             
-                            s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), mnemonic, path)).ok();
+                            s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), path)).ok();
                             }
                             Err(e) => {
                                 eprintln!("Error saving encrypted wallet: {}", e);
@@ -248,8 +262,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut final_results = Vec::new();
     for _ in 0..args.count {
-        if let Ok((addr, pk_hex, mnemonic, path)) = receiver.recv() {
-            final_results.push((addr, pk_hex, mnemonic, path));
+        if let Ok((addr, pk_hex, path)) = receiver.recv() {
+            final_results.push((addr, pk_hex, path));
         }
     }
 
