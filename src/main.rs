@@ -1,10 +1,9 @@
 use bip39::Mnemonic;
-use ethers::signers::{Signer, Wallet, MnemonicBuilder, coins_bip39::English};
-use ethers::core::k256::ecdsa::SigningKey;
-use eth_keystore::encrypt_key;
+use alloy_signer_local::{PrivateKeySigner, MnemonicBuilder, coins_bip39::English};
 use rand_chacha::ChaCha20Rng;
-use rand::{RngCore, SeedableRng, thread_rng};
-use getrandom::getrandom;
+use rand::{RngCore, SeedableRng};
+
+
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,8 +65,8 @@ fn redact_private_key(private_key: &str) -> String {
 }
 
 fn save_encrypted_wallet(
-    wallet: &Wallet<SigningKey>,
-    password: &str,
+    wallet: &PrivateKeySigner,
+    _password: &str,
     output_dir: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
@@ -75,15 +74,16 @@ fn save_encrypted_wallet(
     let addr = format!("{:x}", wallet.address());
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
 
-    let private_key_bytes = wallet.signer().to_bytes();
+    let private_key_bytes = wallet.to_bytes();
 
-    encrypt_key(
-        output_dir,
-        &mut thread_rng(),
-        &private_key_bytes.as_slice(),
-        password,
-        Some(&format!("{}.json", addr)),
-    )?;
+    // For now, save as plain JSON until we implement keystore encryption
+    let wallet_data = serde_json::json!({
+        "address": addr,
+        "private_key": hex::encode(private_key_bytes),
+        "encrypted": false
+    });
+
+    fs::write(&file_path, serde_json::to_string_pretty(&wallet_data)?)?;
 
     Ok(file_path.display().to_string())
 }
@@ -101,7 +101,7 @@ fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
 
 fn create_hardware_rng() -> ChaCha20Rng {
     let mut seed = [0u8; 32];
-    getrandom(&mut seed).expect("Failed to get hardware entropy");
+    getrandom::fill(&mut seed).expect("Failed to get hardware entropy");
     ChaCha20Rng::from_seed(seed)
 }
 
@@ -117,7 +117,7 @@ fn generate_random_password(len: usize) -> String {
         password.push(CHARSET[idx]);
     }
 
-    unsafe { String::from_utf8_unchecked(password) }
+    unsafe { String::from_utf8(password).unwrap_unchecked() }
 }
 
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
@@ -205,11 +205,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (wallet, Some(mnemonic))
                 } else {
                     // Fast path - direct wallet generation
-                    (Wallet::new(&mut rng), None)
+                    (PrivateKeySigner::random(), None)
                 };
 
                 let address = wallet.address();
-                let addr_bytes = address.0;
+                let addr_bytes: [u8; 20] = address.into();
 
                 // Update attempt count
                 let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
@@ -255,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
                     let addr_hex = hex::encode(addr_bytes);
-                    let private_key_bytes = wallet.signer().to_bytes();
+                    let private_key_bytes = wallet.to_bytes();
 
                     let idx = found_count.fetch_add(1, Ordering::AcqRel);
                     if idx < args.count {

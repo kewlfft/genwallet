@@ -4,18 +4,18 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-ethers = "2.0"
-bip39 = "2.0"
-rand = { version = "0.8", features = ["std", "getrandom"] }
-rand_chacha = "0.3"
-getrandom = { version = "0.2", features = ["std"] }
-rayon = "1.5"
+alloy = "1.0.22"
+alloy-signer-local = { version = "1.0.22", features = ["mnemonic", "keystore"] }
+bip39 = "2.2"
+rand = { version = "0.8", features = ["std"] }
+rand_chacha = "0.3.1"
+getrandom = { version = "0.3", features = ["std"] }
+rayon = "1.10"
 hex = "0.4"
-num_cpus = "1.13"
-clap = { version = "4.4", features = ["derive"] }
-rpassword = "7.0"
-serde_json = "1.0"
+num_cpus = "1.17"
+clap = { version = "4.5.41", features = ["derive"] }
+rpassword = "7.4.0"
+serde_json = "1.0.141"
 crossbeam = "0.8"
-chrono = { version = "0.4", features = ["serde"] }
-eth-keystore = "0.5.0"
+chrono = { version = "0.4.41", features = ["serde"] }
  
