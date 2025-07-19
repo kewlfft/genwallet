@@ -1,5 +1,5 @@
 use bip39::Mnemonic;
-use alloy_signer_local::{PrivateKeySigner, MnemonicBuilder, coins_bip39::English};
+use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use rand_chacha::ChaCha20Rng;
 use rand::{RngCore, SeedableRng};
 
@@ -15,6 +15,49 @@ use rpassword::prompt_password;
 use crossbeam::channel::unbounded;
 use hex;
 use num_cpus;
+use sha3::{Keccak256, Digest};
+
+// Simple wallet struct using secp256k1
+struct SimpleWallet {
+    private_key: SecretKey,
+    address: [u8; 20],
+}
+
+impl SimpleWallet {
+    fn new(private_key: SecretKey) -> Self {
+        let secp = Secp256k1::new();
+        let public_key = PublicKey::from_secret_key(&secp, &private_key);
+        let public_key_bytes = public_key.serialize_uncompressed();
+        let mut hasher = Keccak256::new();
+        hasher.update(&public_key_bytes[1..]); // Skip the prefix byte
+        let result = hasher.finalize();
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&result[12..]); // Take last 20 bytes
+        
+        Self { private_key, address }
+    }
+    
+    fn random(rng: &mut ChaCha20Rng) -> Self {
+        let mut private_key_bytes = [0u8; 32];
+        rng.fill_bytes(&mut private_key_bytes);
+        let private_key = SecretKey::from_byte_array(private_key_bytes).expect("Invalid private key");
+        Self::new(private_key)
+    }
+    
+    fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, Box<dyn std::error::Error>> {
+        let seed = mnemonic.to_seed("");
+        let private_key = SecretKey::from_byte_array(seed[..32].try_into()?)?;
+        Ok(Self::new(private_key))
+    }
+    
+    fn address(&self) -> [u8; 20] {
+        self.address
+    }
+    
+    fn to_bytes(&self) -> [u8; 32] {
+        self.private_key.secret_bytes()
+    }
+}
 
 
 #[derive(Parser, Debug)]
@@ -58,27 +101,27 @@ fn redact_private_key(private_key: &str) -> String {
     if private_key.len() <= 12 {
         "*".repeat(private_key.len())
     } else {
-        let prefix = &private_key[..6];
-        let suffix = &private_key[private_key.len() - 6..];
-        format!("{}...{}", prefix, suffix)
+    let prefix = &private_key[..6];
+    let suffix = &private_key[private_key.len() - 6..];
+    format!("{}...{}", prefix, suffix)
     }
 }
 
 fn save_encrypted_wallet(
-    wallet: &PrivateKeySigner,
+    wallet: &SimpleWallet,
     _password: &str,
     output_dir: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    let addr = format!("{:x}", wallet.address());
+    let addr = hex::encode(wallet.address());
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
 
     let private_key_bytes = wallet.to_bytes();
 
     // For now, save as plain JSON until we implement keystore encryption
     let wallet_data = serde_json::json!({
-        "address": addr,
+        "address": format!("0x{}", addr),
         "private_key": hex::encode(private_key_bytes),
         "encrypted": false
     });
@@ -131,14 +174,14 @@ fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-
+    
     if args.count == 0 {
         return Err("Number of wallets must be greater than 0".into());
     }
     if args.start_pattern.len() > 40 || args.end_pattern.len() > 40 {
         return Err("Pattern length cannot exceed 40 characters".into());
     }
-
+    
     let pattern_start = args.start_pattern.to_lowercase();
     let pattern_end = args.end_pattern.to_lowercase();
     let start_nybbles = hex_to_nybbles(&pattern_start);
@@ -194,10 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(_) => continue,
                     };
 
-                    let wallet = match MnemonicBuilder::<English>::default()
-                        .phrase(mnemonic.to_string().as_str())
-                        .build() 
-                    {
+                    let wallet = match SimpleWallet::from_mnemonic(&mnemonic) {
                         Ok(w) => w,
                         Err(_) => continue,
                     };
@@ -205,18 +245,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     (wallet, Some(mnemonic))
                 } else {
                     // Fast path - direct wallet generation
-                    (PrivateKeySigner::random(), None)
+                    (SimpleWallet::random(&mut rng), None)
                 };
 
-                let address = wallet.address();
-                let addr_bytes: [u8; 20] = address.into();
-
+                let addr_bytes = wallet.address();
+            
                 // Update attempt count
-                let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
-                if current_attempts % progress_interval == 0 {
-                    let elapsed = start_time.elapsed();
-                    let rate = current_attempts as f64 / elapsed.as_secs_f64();
-                    let found = found_count.load(Ordering::Relaxed);
+            let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
+            if current_attempts % progress_interval == 0 {
+                let elapsed = start_time.elapsed();
+                let rate = current_attempts as f64 / elapsed.as_secs_f64();
+                let found = found_count.load(Ordering::Relaxed);
 
                     let remaining_wallets = args.count.saturating_sub(found);
                     let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
@@ -264,11 +303,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("\n🎉 Found wallet {} of {}", idx + 1, args.count);
                                 println!("Address:    0x{}", addr_hex);
                                 if args.show_full_key {
-                                    println!("PrivateKey: {}", hex::encode(private_key_bytes.as_slice()));
+                                    println!("PrivateKey: {}", hex::encode(private_key_bytes));
                                 } else {
                                     println!(
                                         "PrivateKey: {}",
-                                        redact_private_key(&hex::encode(private_key_bytes.as_slice()))
+                                        redact_private_key(&hex::encode(private_key_bytes))
                                     );
                                 }
                                 if args.show_mnemonic {
@@ -280,7 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Saved to:   {}", path);
                                 println!("---");
 
-                                s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), path))
+                                s.send((addr_hex, hex::encode(private_key_bytes), path))
                                     .ok();
                             }
                             Err(e) => {
