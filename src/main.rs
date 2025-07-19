@@ -47,7 +47,7 @@ struct Args {
     #[arg(long = "ask-password")]
     ask_password: bool,
 
-    #[arg(short = 'o', long = "output-dir", default_value = "/tmp/generate")]
+    #[arg(short = 'o', long = "output-dir", default_value = "/tmp/generated_wallets")]
     output_dir: String,
 
     #[arg(short = 'n', long = "wallets", default_value = "1")]
