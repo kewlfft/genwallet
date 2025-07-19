@@ -177,15 +177,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let progress_interval = if args.show_mnemonic { 10_000 } else { 100_000 };
 
-    (0..thread_count).into_par_iter().enumerate().for_each_with(
-        (sender, total_attempts.clone()),
-        |(s, attempts), (_thread_id, _)| {
-            let mut rng = create_hardware_rng();
+    if args.show_mnemonic {
+        // Mnemonic path - uses hardware RNG
+        (0..thread_count).into_par_iter().enumerate().for_each_with(
+            (sender, total_attempts.clone()),
+            |(s, attempts), (_thread_id, _)| {
+                let mut rng = create_hardware_rng();
 
-            while found_count.load(Ordering::Acquire) < args.count {
-                // Generate wallet (with optional mnemonic for slow path)
-
-                let (wallet, mnemonic) = if args.show_mnemonic {
+                while found_count.load(Ordering::Acquire) < args.count {
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
 
@@ -202,96 +201,177 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(_) => continue,
                     };
 
-                    (wallet, Some(mnemonic))
-                } else {
-                    let wallet = Wallet::new(&mut rng);
-                    (wallet, None)
-                };
+                    let address = wallet.address();
+                    let addr_bytes = address.0;
 
+                    // Update attempt count
+                    let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
+                    if current_attempts % progress_interval == 0 {
+                        let elapsed = start_time.elapsed();
+                        let rate = current_attempts as f64 / elapsed.as_secs_f64();
+                        let found = found_count.load(Ordering::Relaxed);
 
-                let address = wallet.address();
-                let addr_bytes = address.0;
-
-                // Update attempt count
-                let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
-                if current_attempts % progress_interval == 0 {
-                    let elapsed = start_time.elapsed();
-                    let rate = current_attempts as f64 / elapsed.as_secs_f64();
-                    let found = found_count.load(Ordering::Relaxed);
-
-                    let remaining_wallets = args.count.saturating_sub(found);
-                    let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
-                        let attempts_per_wallet = current_attempts as f64 / found as f64;
-                        let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
-                        remaining_attempts / rate
-                    } else if rate > 0.0 && remaining_wallets > 0 {
-                        let estimated_attempts_per_wallet = pattern_difficulty;
-                        let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
-                        remaining_attempts / rate
-                    } else {
-                        0.0
-                    };
-
-                    let eta_str = if eta_seconds > 0.0 {
-                        if eta_seconds < 60.0 {
-                            format!("{:.0}s", eta_seconds)
-                        } else if eta_seconds < 3600.0 {
-                            format!("{:.0}m", eta_seconds / 60.0)
+                        let remaining_wallets = args.count.saturating_sub(found);
+                        let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
+                            let attempts_per_wallet = current_attempts as f64 / found as f64;
+                            let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
+                        } else if rate > 0.0 && remaining_wallets > 0 {
+                            let estimated_attempts_per_wallet = pattern_difficulty;
+                            let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
                         } else {
-                            format!("{:.1}h", eta_seconds / 3600.0)
-                        }
-                    } else {
-                        "∞".to_string()
-                    };
+                            0.0
+                        };
 
-                    print!(
-                        "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
-                        current_attempts / 1_000_000,
-                        found,
-                        args.count,
-                        rate / 1_000.0,
-                        eta_str
-                    );
-                }
-
-                if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
-                    let addr_hex = hex::encode(addr_bytes);
-                    let private_key_bytes = wallet.signer().to_bytes();
-
-                    let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                    if idx < args.count {
-                        match save_encrypted_wallet(&wallet, &password, &args.output_dir) {
-                            Ok(path) => {
-                                println!("\n🎉 Found wallet {} of {}", idx + 1, args.count);
-                                println!("Address:    0x{}", addr_hex);
-                                if args.show_full_key {
-                                    println!("PrivateKey: {}", hex::encode(private_key_bytes.as_slice()));
-                                } else {
-                                    println!(
-                                        "PrivateKey: {}",
-                                        redact_private_key(&hex::encode(private_key_bytes.as_slice()))
-                                    );
-                                }
-                                if let Some(m) = mnemonic {
-                                    println!("Mnemonic:   {}", m.to_string());
-                                }
-                                println!("Saved to:   {}", path);
-                                println!("---");
-
-                                s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), path))
-                                    .ok();
+                        let eta_str = if eta_seconds > 0.0 {
+                            if eta_seconds < 60.0 {
+                                format!("{:.0}s", eta_seconds)
+                            } else if eta_seconds < 3600.0 {
+                                format!("{:.0}m", eta_seconds / 60.0)
+                            } else {
+                                format!("{:.1}h", eta_seconds / 3600.0)
                             }
-                            Err(e) => {
-                                eprintln!("Error saving encrypted wallet: {}", e);
+                        } else {
+                            "∞".to_string()
+                        };
+
+                        print!(
+                            "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
+                            current_attempts / 1_000_000,
+                            found,
+                            args.count,
+                            rate / 1_000.0,
+                            eta_str
+                        );
+                    }
+
+                    if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
+                        let addr_hex = hex::encode(addr_bytes);
+                        let private_key_bytes = wallet.signer().to_bytes();
+
+                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                        if idx < args.count {
+                            match save_encrypted_wallet(&wallet, &password, &args.output_dir) {
+                                Ok(path) => {
+                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args.count);
+                                    println!("Address:    0x{}", addr_hex);
+                                    if args.show_full_key {
+                                        println!("PrivateKey: {}", hex::encode(private_key_bytes.as_slice()));
+                                    } else {
+                                        println!(
+                                            "PrivateKey: {}",
+                                            redact_private_key(&hex::encode(private_key_bytes.as_slice()))
+                                        );
+                                    }
+                                    println!("Mnemonic:   {}", mnemonic.to_string());
+                                    println!("Saved to:   {}", path);
+                                    println!("---");
+
+                                    s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), path))
+                                        .ok();
+                                }
+                                Err(e) => {
+                                    eprintln!("Error saving encrypted wallet: {}", e);
+                                }
                             }
+                        } else {
+                            break;
                         }
-                    } else {
-                        break;
                     }
                 }
-            }
-        },
-    );
+            },
+        );
+    } else {
+        // Fast path - uses thread_rng for better performance
+        (0..thread_count).into_par_iter().enumerate().for_each_with(
+            (sender, total_attempts.clone()),
+            |(s, attempts), (_thread_id, _)| {
+                let mut rng = thread_rng();
+
+                while found_count.load(Ordering::Acquire) < args.count {
+                    let wallet = Wallet::new(&mut rng);
+                    let address = wallet.address();
+                    let addr_bytes = address.0;
+
+                    // Update attempt count
+                    let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
+                    if current_attempts % progress_interval == 0 {
+                        let elapsed = start_time.elapsed();
+                        let rate = current_attempts as f64 / elapsed.as_secs_f64();
+                        let found = found_count.load(Ordering::Relaxed);
+
+                        let remaining_wallets = args.count.saturating_sub(found);
+                        let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
+                            let attempts_per_wallet = current_attempts as f64 / found as f64;
+                            let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
+                        } else if rate > 0.0 && remaining_wallets > 0 {
+                            let estimated_attempts_per_wallet = pattern_difficulty;
+                            let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
+                        } else {
+                            0.0
+                        };
+
+                        let eta_str = if eta_seconds > 0.0 {
+                            if eta_seconds < 60.0 {
+                                format!("{:.0}s", eta_seconds)
+                            } else if eta_seconds < 3600.0 {
+                                format!("{:.0}m", eta_seconds / 60.0)
+                            } else {
+                                format!("{:.1}h", eta_seconds / 3600.0)
+                            }
+                        } else {
+                            "∞".to_string()
+                        };
+
+                        print!(
+                            "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
+                            current_attempts / 1_000_000,
+                            found,
+                            args.count,
+                            rate / 1_000.0,
+                            eta_str
+                        );
+                    }
+
+                    if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
+                        let addr_hex = hex::encode(addr_bytes);
+                        let private_key_bytes = wallet.signer().to_bytes();
+
+                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                        if idx < args.count {
+                            match save_encrypted_wallet(&wallet, &password, &args.output_dir) {
+                                Ok(path) => {
+                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args.count);
+                                    println!("Address:    0x{}", addr_hex);
+                                    if args.show_full_key {
+                                        println!("PrivateKey: {}", hex::encode(private_key_bytes.as_slice()));
+                                    } else {
+                                        println!(
+                                            "PrivateKey: {}",
+                                            redact_private_key(&hex::encode(private_key_bytes.as_slice()))
+                                        );
+                                    }
+                                    println!("Saved to:   {}", path);
+                                    println!("---");
+
+                                    s.send((addr_hex, hex::encode(private_key_bytes.as_slice()), path))
+                                        .ok();
+                                }
+                                Err(e) => {
+                                    eprintln!("Error saving encrypted wallet: {}", e);
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            },
+        );
+    }
 
     let mut final_results = Vec::new();
     for _ in 0..args.count {
