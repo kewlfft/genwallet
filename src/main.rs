@@ -103,8 +103,12 @@ fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
 }
 
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
-    let hex = |b: u8| [b >> 4, b & 0x0F];
-    let addr_nybbles: Vec<u8> = addr.iter().flat_map(|b| hex(*b)).collect();
+    // Stack-based nybble array - no heap allocation!
+    let mut addr_nybbles = [0u8; 40];
+    for (i, &byte) in addr.iter().enumerate() {
+        addr_nybbles[i * 2] = byte >> 4;
+        addr_nybbles[i * 2 + 1] = byte & 0x0F;
+    }
     addr_nybbles.starts_with(start_hex) && addr_nybbles.ends_with(end_hex)
 }
 
@@ -120,10 +124,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Pattern length cannot exceed 40 characters".into());
     }
     
+    // Convert patterns to lowercase once and convert to nybbles
     let pattern_start = args.start_pattern.to_lowercase();
     let pattern_end = args.end_pattern.to_lowercase();
     let start_nybbles = hex_to_nybbles(&pattern_start);
     let end_nybbles = hex_to_nybbles(&pattern_end);
+    
+    // Pre-calculate pattern difficulty for ETA estimation
+    let pattern_difficulty = if !pattern_start.is_empty() && !pattern_end.is_empty() {
+        16.0_f64.powi((pattern_start.len() + pattern_end.len()) as i32)
+    } else if !pattern_start.is_empty() {
+        16.0_f64.powi(pattern_start.len() as i32)
+    } else if !pattern_end.is_empty() {
+        16.0_f64.powi(pattern_end.len() as i32)
+    } else {
+        1.0 // No pattern, should find quickly
+    };
+    
     let thread_count = args.threads.unwrap_or_else(num_cpus::get);
 
     let password = if let Some(pw) = args.password {
@@ -168,19 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
                     remaining_attempts / rate
                 } else if rate > 0.0 && remaining_wallets > 0 {
-                    // No wallets found yet - use a conservative estimate
-                    // For a 40-character hex address, each character has 16 possibilities
-                    // So the probability of matching a pattern depends on pattern length
-                    let pattern_difficulty = if !pattern_start.is_empty() && !pattern_end.is_empty() {
-                        16.0_f64.powi((pattern_start.len() + pattern_end.len()) as i32)
-                    } else if !pattern_start.is_empty() {
-                        16.0_f64.powi(pattern_start.len() as i32)
-                    } else if !pattern_end.is_empty() {
-                        16.0_f64.powi(pattern_end.len() as i32)
-                    } else {
-                        1.0 // No pattern, should find quickly
-                    };
-                    
+                    // No wallets found yet - use pre-calculated pattern difficulty
                     let estimated_attempts_per_wallet = pattern_difficulty;
                     let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
                     remaining_attempts / rate
