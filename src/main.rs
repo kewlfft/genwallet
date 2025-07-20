@@ -60,9 +60,12 @@ struct SimpleWallet {
 
 impl SimpleWallet {
     fn new(private_key: SecretKey) -> Self {
-        let secp = Secp256k1::new();
-        let public_key = PublicKey::from_secret_key(&secp, &private_key);
+        static SECP256K1: once_cell::sync::Lazy<Secp256k1<secp256k1::All>> = 
+            once_cell::sync::Lazy::new(Secp256k1::new);
+        
+        let public_key = PublicKey::from_secret_key(&SECP256K1, &private_key);
         let public_key_bytes = public_key.serialize_uncompressed();
+
         let result = Keccak256::digest(&public_key_bytes[1..]); // Skip the prefix byte
         let mut address = [0u8; 20];
         address.copy_from_slice(&result[12..]); // Take last 20 bytes
@@ -94,10 +97,12 @@ impl SimpleWallet {
         Ok(Self::new(private_key))
     }
     
+    #[inline(always)]
     fn address(&self) -> [u8; 20] {
         self.address
     }
     
+    #[inline(always)]
     fn to_bytes(&self) -> [u8; 32] {
         self.private_key.secret_bytes()
     }
