@@ -59,6 +59,7 @@ struct SimpleWallet {
 }
 
 impl SimpleWallet {
+    #[inline]
     fn new(private_key: SecretKey) -> Self {
         static SECP256K1: once_cell::sync::Lazy<Secp256k1<secp256k1::All>> = 
             once_cell::sync::Lazy::new(Secp256k1::new);
@@ -76,6 +77,7 @@ impl SimpleWallet {
         Self { private_key, address }
     }
     
+    #[inline]
     fn random(rng: &mut ChaCha20Rng) -> Self {
         let mut private_key_bytes = [0u8; 32];
         rng.fill_bytes(&mut private_key_bytes);
@@ -100,12 +102,12 @@ impl SimpleWallet {
         Ok(Self::new(private_key))
     }
     
-    #[inline(always)]
+    #[inline]
     fn address(&self) -> [u8; 20] {
         self.address
     }
     
-    #[inline(always)]
+    #[inline]
     fn to_bytes(&self) -> [u8; 32] {
         self.private_key.secret_bytes()
     }
@@ -243,6 +245,7 @@ fn create_hardware_rng() -> ChaCha20Rng {
     ChaCha20Rng::from_seed(seed)
 }
 
+#[inline]
 fn hex_encode(data: &[u8]) -> String {
     // Use exact capacity for common sizes to avoid reallocations
     let capacity = match data.len() {
@@ -275,7 +278,7 @@ fn generate_random_password(len: usize) -> String {
     unsafe { String::from_utf8(password).unwrap_unchecked() }
 }
 
-#[inline(always)]
+#[inline]
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
     let nybble = |i: usize| if i % 2 == 0 { addr[i / 2] >> 4 } else { addr[i / 2] & 0x0F };
 
