@@ -7,7 +7,6 @@ use scrypt::{scrypt, Params as ScryptParams};
 use aes::Aes128;
 use ctr::Ctr32BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize)]
@@ -184,10 +183,16 @@ fn save_encrypted_wallet(
     // Calculate MAC (SHA3-256 of derived_key[16..32] + ciphertext)
     let mac = Keccak256::digest([&derived_key[16..32], &ciphertext].concat());
 
+    // Generate unique ID: timestamp + random
+    let id = format!("{:x}-{:x}", 
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        rng.next_u64()
+    );
+
     // Create keystore structure
     let keystore = Keystore {
         version: 3,
-        id: Uuid::new_v4().to_string(),
+        id,
         address: format!("0x{}", addr),
         crypto: Crypto {
             ciphertext: hex_encode(&ciphertext),

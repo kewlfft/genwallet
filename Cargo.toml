@@ -1,6 +1,6 @@
 [package]
 name = "genwallet"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2021"
 
 [dependencies]
@@ -11,7 +11,6 @@ bip32 = "0.5.3"
 scrypt = "0.11"
 aes = "0.8"
 ctr = "0.9"
-uuid = { version = "1.0", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
