@@ -42,8 +42,6 @@ struct KdfParams {
     p: u32,
 }
 
-
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,9 +49,8 @@ use clap::Parser;
 use std::fs;
 use std::path::Path;
 use rpassword::prompt_password;
-use crossbeam::channel::unbounded;
-use hex;
-use num_cpus;
+use std::sync::mpsc;
+use std::thread;
 use sha3::{Keccak256, Digest};
 
 // Simple wallet struct using secp256k1
@@ -164,7 +161,7 @@ fn save_encrypted_wallet(
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    let addr = hex::encode(wallet.address());
+    let addr = hex_encode(&wallet.address());
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
     let private_key_bytes = wallet.to_bytes();
 
@@ -198,20 +195,20 @@ fn save_encrypted_wallet(
         id: Uuid::new_v4().to_string(),
         address: format!("0x{}", addr),
         crypto: Crypto {
-            ciphertext: hex::encode(ciphertext),
+            ciphertext: hex_encode(&ciphertext),
             cipherparams: CipherParams {
-                iv: hex::encode(iv),
+                iv: hex_encode(&iv),
             },
             cipher: "aes-128-ctr".to_string(),
             kdf: "scrypt".to_string(),
             kdfparams: KdfParams {
                 dklen: 32,
-                salt: hex::encode(salt),
+                salt: hex_encode(&salt),
                 n: 262144,
                 r: 8,
                 p: 1,
             },
-            mac: hex::encode(mac),
+            mac: hex_encode(&mac),
         },
     };
 
@@ -236,6 +233,16 @@ fn create_hardware_rng() -> ChaCha20Rng {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("Failed to get hardware entropy");
     ChaCha20Rng::from_seed(seed)
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    const HEX_CHARS: &[u8] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(data.len() * 2);
+    for &byte in data {
+        hex.push(HEX_CHARS[(byte >> 4) as usize] as char);
+        hex.push(HEX_CHARS[(byte & 0x0F) as usize] as char);
+    }
+    hex
 }
 
 fn generate_random_password(len: usize) -> String {
@@ -287,7 +294,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         1.0
     };
 
-    let thread_count = args.threads.unwrap_or_else(num_cpus::get);
+    let thread_count = args.threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
 
     let password = if let Some(pw) = args.password {
         pw
@@ -306,18 +317,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let found_count = Arc::new(AtomicUsize::new(0));
     let total_attempts = Arc::new(AtomicU64::new(0));
-    let (sender, receiver) = unbounded();
+    let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
     let progress_interval = if args.show_mnemonic { 10_000 } else { 100_000 };
 
-    // Single optimized code path using ChaCha20Rng for both cases
-    (0..thread_count).into_par_iter().enumerate().for_each_with(
-        (sender, total_attempts.clone()),
-        |(s, attempts), (_thread_id, _)| {
+    // Create threads manually instead of using rayon
+    let mut handles = Vec::new();
+    for _ in 0..thread_count {
+        let sender = sender.clone();
+        let total_attempts = total_attempts.clone();
+        let found_count = found_count.clone();
+        let start_nybbles = start_nybbles.clone();
+        let end_nybbles = end_nybbles.clone();
+        let args_count = args.count;
+        let args_show_mnemonic = args.show_mnemonic;
+        let password = password.clone();
+        let output_dir = args.output_dir.clone();
+        let args_show_full_key = args.show_full_key;
+        let _args_show_mnemonic = args.show_mnemonic;
+        let pattern_difficulty = pattern_difficulty;
+        
+        let handle = thread::spawn(move || {
             let mut rng = create_hardware_rng();
 
-            while found_count.load(Ordering::Acquire) < args.count {
-                let (wallet, mnemonic) = if args.show_mnemonic {
+            while found_count.load(Ordering::Acquire) < args_count {
+                let (wallet, mnemonic) = if args_show_mnemonic {
                     // Mnemonic path - generate entropy and create wallet from mnemonic
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
@@ -341,13 +365,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let addr_bytes = wallet.address();
             
                 // Update attempt count
-            let current_attempts = attempts.fetch_add(1, Ordering::Relaxed);
-            if current_attempts % progress_interval == 0 {
-                let elapsed = start_time.elapsed();
-                let rate = current_attempts as f64 / elapsed.as_secs_f64();
-                let found = found_count.load(Ordering::Relaxed);
+                let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
+                if current_attempts % progress_interval == 0 {
+                    let elapsed = start_time.elapsed();
+                    let rate = current_attempts as f64 / elapsed.as_secs_f64();
+                    let found = found_count.load(Ordering::Relaxed);
 
-                    let remaining_wallets = args.count.saturating_sub(found);
+                    let remaining_wallets = args_count.saturating_sub(found);
                     let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
                         let attempts_per_wallet = current_attempts as f64 / found as f64;
                         let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
@@ -376,31 +400,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
                         current_attempts / 1_000_000,
                         found,
-                        args.count,
+                        args_count,
                         rate / 1_000.0,
                         eta_str
                     );
                 }
 
                 if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
-                    let addr_hex = hex::encode(addr_bytes);
+                    let addr_hex = hex_encode(&addr_bytes);
                     let private_key_bytes = wallet.to_bytes();
 
                     let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                    if idx < args.count {
-                        match save_encrypted_wallet(&wallet, &password, &args.output_dir) {
+                    if idx < args_count {
+                        match save_encrypted_wallet(&wallet, &password, &output_dir) {
                             Ok(path) => {
-                                println!("\n🎉 Found wallet {} of {}", idx + 1, args.count);
+                                println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
                                 println!("Address:    0x{}", addr_hex);
-                                if args.show_full_key {
-                                    println!("PrivateKey: {}", hex::encode(private_key_bytes));
+                                if args_show_full_key {
+                                    println!("PrivateKey: {}", hex_encode(&private_key_bytes));
                                 } else {
                                     println!(
                                         "PrivateKey: {}",
-                                        redact_private_key(&hex::encode(private_key_bytes))
+                                        redact_private_key(&hex_encode(&private_key_bytes))
                                     );
                                 }
-                                if args.show_mnemonic {
+                                if args_show_mnemonic {
                                     // Display the stored mnemonic
                                     if let Some(m) = mnemonic {
                                         println!("Mnemonic:   {}", m.to_string());
@@ -409,7 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Saved to:   {}", path);
                                 println!("---");
 
-                                s.send((addr_hex, hex::encode(private_key_bytes), path))
+                                sender.send((addr_hex, hex_encode(&private_key_bytes), path))
                                     .ok();
                             }
                             Err(e) => {
@@ -421,8 +445,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-        },
-    );
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
 
     let mut final_results = Vec::new();
     for _ in 0..args.count {

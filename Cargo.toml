@@ -20,15 +20,8 @@ rand = { version = "0.9", features = ["std"] }
 rand_chacha = "0.9"
 getrandom = { version = "0.3", features = ["std"] }
 
-# Parallel processing
-rayon = "1.10"
-
 # Utilities
-hex = "0.4"
-num_cpus = "1.17"
 clap = { version = "4.5.41", features = ["derive"] }
 rpassword = "7.4.0"
-crossbeam = "0.8"
-chrono = { version = "0.4.41", features = ["serde"] }
 sha3 = "0.10"
  
