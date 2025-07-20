@@ -267,13 +267,20 @@ fn generate_random_password(len: usize) -> String {
     unsafe { String::from_utf8(password).unwrap_unchecked() }
 }
 
+#[inline(always)]
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
-    let mut addr_nybbles = [0u8; 40];
-    for (i, &byte) in addr.iter().enumerate() {
-        addr_nybbles[i * 2] = byte >> 4;
-        addr_nybbles[i * 2 + 1] = byte & 0x0F;
+    let nybble = |i: usize| if i % 2 == 0 { addr[i / 2] >> 4 } else { addr[i / 2] & 0x0F };
+
+    let prefix_match = start_hex.iter().enumerate().all(|(i, &expected)| nybble(i) == expected);
+    if !prefix_match {
+        return false;
     }
-    addr_nybbles.starts_with(start_hex) && addr_nybbles.ends_with(end_hex)
+
+    let suffix_len = end_hex.len();
+    let total_nybbles = 40;
+    let suffix_start = total_nybbles - suffix_len;
+
+    end_hex.iter().enumerate().all(|(i, &expected)| nybble(suffix_start + i) == expected)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
