@@ -64,9 +64,7 @@ impl SimpleWallet {
         let secp = Secp256k1::new();
         let public_key = PublicKey::from_secret_key(&secp, &private_key);
         let public_key_bytes = public_key.serialize_uncompressed();
-        let mut hasher = Keccak256::new();
-        hasher.update(&public_key_bytes[1..]); // Skip the prefix byte
-        let result = hasher.finalize();
+        let result = Keccak256::digest(&public_key_bytes[1..]); // Skip the prefix byte
         let mut address = [0u8; 20];
         address.copy_from_slice(&result[12..]); // Take last 20 bytes
         
@@ -184,10 +182,7 @@ fn save_encrypted_wallet(
     cipher.apply_keystream(&mut ciphertext);
 
     // Calculate MAC (SHA3-256 of derived_key[16..32] + ciphertext)
-    let mut hasher = Keccak256::new();
-    hasher.update(&derived_key[16..32]);
-    hasher.update(&ciphertext);
-    let mac = hasher.finalize();
+    let mac = Keccak256::digest([&derived_key[16..32], &ciphertext].concat());
 
     // Create keystore structure
     let keystore = Keystore {
@@ -236,11 +231,18 @@ fn create_hardware_rng() -> ChaCha20Rng {
 }
 
 fn hex_encode(data: &[u8]) -> String {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    let mut hex = String::with_capacity(data.len() * 2);
+    // Use exact capacity for common sizes to avoid reallocations
+    let capacity = match data.len() {
+        16 => 32,  // IV
+        20 => 40,  // Address
+        32 => 64,  // Private key, salt, derived key, MAC
+        64 => 128, // SHA3-256 hash
+        _ => data.len() * 2, // Fallback for other sizes
+    };
+    let mut hex = String::with_capacity(capacity);
     for &byte in data {
-        hex.push(HEX_CHARS[(byte >> 4) as usize] as char);
-        hex.push(HEX_CHARS[(byte & 0x0F) as usize] as char);
+        hex.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+        hex.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
     }
     hex
 }
@@ -321,9 +323,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let progress_interval = if args.show_mnemonic { 10_000 } else { 100_000 };
 
+    // Create seeds once using hardware entropy
+    let mut master_rng = create_hardware_rng();
+    let seeds: Vec<[u8; 32]> = (0..thread_count)
+        .map(|_| {
+            let mut seed = [0u8; 32];
+            master_rng.fill_bytes(&mut seed);
+            seed
+        })
+        .collect();
+
     // Create threads manually instead of using rayon
     let mut handles = Vec::new();
-    for _ in 0..thread_count {
+    for (_i, seed) in seeds.into_iter().enumerate() {
         let sender = sender.clone();
         let total_attempts = total_attempts.clone();
         let found_count = found_count.clone();
@@ -338,7 +350,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pattern_difficulty = pattern_difficulty;
         
         let handle = thread::spawn(move || {
-            let mut rng = create_hardware_rng();
+            let mut rng = ChaCha20Rng::from_seed(seed);
 
             while found_count.load(Ordering::Acquire) < args_count {
                 let (wallet, mnemonic) = if args_show_mnemonic {
