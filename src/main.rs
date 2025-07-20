@@ -120,7 +120,6 @@ impl SimpleWallet {
     author = "Wallet Generator",
     version,
     about = "Generate Ethereum wallets with address pattern matching",
-    long_about = "A multi-threaded Ethereum wallet generator that creates wallets with addresses matching specified patterns"
 )]
 struct Args {
     #[arg(short = 's', long = "start", default_value = "")]
