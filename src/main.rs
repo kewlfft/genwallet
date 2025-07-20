@@ -64,11 +64,14 @@ impl SimpleWallet {
             once_cell::sync::Lazy::new(Secp256k1::new);
         
         let public_key = PublicKey::from_secret_key(&SECP256K1, &private_key);
-        let public_key_bytes = public_key.serialize_uncompressed();
+        let pub_bytes = public_key.serialize_uncompressed();
 
-        let result = Keccak256::digest(&public_key_bytes[1..]); // Skip the prefix byte
+        let mut hasher = Keccak256::new();
+        hasher.update(&pub_bytes[1..]);
+        let hash = hasher.finalize();
+
         let mut address = [0u8; 20];
-        address.copy_from_slice(&result[12..]); // Take last 20 bytes
+        address.copy_from_slice(&hash[12..]);
         
         Self { private_key, address }
     }
