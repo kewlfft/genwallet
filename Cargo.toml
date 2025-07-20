@@ -5,10 +5,10 @@ edition = "2021"
 
 [dependencies]
 # Core cryptography - ultra minimal dependencies
-secp256k1 = "0.31"
+secp256k1 = "0.31.1"
 bip39 = "2.2"
 bip32 = "0.5.3"
-scrypt = "0.10"
+scrypt = "0.11"
 aes = "0.8"
 ctr = "0.9"
 uuid = { version = "1.0", features = ["v4"] }
