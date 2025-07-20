@@ -3,6 +3,44 @@ use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use rand_chacha::ChaCha20Rng;
 use rand::{RngCore, SeedableRng};
 use bip32::XPrv;
+use scrypt::{scrypt, Params as ScryptParams};
+use aes::Aes128;
+use ctr::Ctr32BE;
+use ctr::cipher::{KeyIvInit, StreamCipher};
+use uuid::Uuid;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Keystore {
+    version: u32,
+    id: String,
+    address: String,
+    crypto: Crypto,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Crypto {
+    ciphertext: String,
+    cipherparams: CipherParams,
+    cipher: String,
+    kdf: String,
+    kdfparams: KdfParams,
+    mac: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CipherParams {
+    iv: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KdfParams {
+    dklen: u32,
+    salt: String,
+    n: u32,
+    r: u32,
+    p: u32,
+}
 
 
 use rayon::prelude::*;
@@ -121,24 +159,64 @@ fn redact_private_key(private_key: &str) -> String {
 
 fn save_encrypted_wallet(
     wallet: &SimpleWallet,
-    _password: &str,
+    password: &str,
     output_dir: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
     let addr = hex::encode(wallet.address());
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
-
     let private_key_bytes = wallet.to_bytes();
 
-    // For now, save as plain JSON until we implement keystore encryption
-    let wallet_data = serde_json::json!({
-        "address": format!("0x{}", addr),
-        "private_key": hex::encode(private_key_bytes),
-        "encrypted": false
-    });
+    // Generate random salt and IV
+    let mut rng = create_hardware_rng();
+    let mut salt = [0u8; 32];
+    let mut iv = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    rng.fill_bytes(&mut iv);
 
-    fs::write(&file_path, serde_json::to_string_pretty(&wallet_data)?)?;
+    // Derive key using scrypt (same as ethers.js)
+    let mut derived_key = [0u8; 32];
+    // Use exact same parameters as ethers.js: n=262144, r=8, p=1
+    let scrypt_params = ScryptParams::new(18, 8, 1).unwrap(); // log_n=18 means n=2^18=262144
+    scrypt(password.as_bytes(), &salt, &scrypt_params, &mut derived_key).unwrap();
+
+    // Encrypt private key using AES-128-CTR
+    let mut cipher = Ctr32BE::<Aes128>::new_from_slices(&derived_key[..16], &iv).unwrap();
+    let mut ciphertext = private_key_bytes;
+    cipher.apply_keystream(&mut ciphertext);
+
+    // Calculate MAC (SHA3-256 of derived_key[16..32] + ciphertext)
+    let mut hasher = Keccak256::new();
+    hasher.update(&derived_key[16..32]);
+    hasher.update(&ciphertext);
+    let mac = hasher.finalize();
+
+    // Create keystore structure
+    let keystore = Keystore {
+        version: 3,
+        id: Uuid::new_v4().to_string(),
+        address: format!("0x{}", addr),
+        crypto: Crypto {
+            ciphertext: hex::encode(ciphertext),
+            cipherparams: CipherParams {
+                iv: hex::encode(iv),
+            },
+            cipher: "aes-128-ctr".to_string(),
+            kdf: "scrypt".to_string(),
+            kdfparams: KdfParams {
+                dklen: 32,
+                salt: hex::encode(salt),
+                n: 262144,
+                r: 8,
+                p: 1,
+            },
+            mac: hex::encode(mac),
+        },
+    };
+
+    // Save as JSON
+    fs::write(&file_path, serde_json::to_string_pretty(&keystore)?)?;
 
     Ok(file_path.display().to_string())
 }
