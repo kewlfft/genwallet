@@ -8,6 +8,7 @@ use aes::Aes128;
 use ctr::Ctr32BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use serde::{Serialize, Deserialize};
+use std::sync::LazyLock;
 
 #[derive(Serialize, Deserialize)]
 struct Keystore {
@@ -61,8 +62,8 @@ struct SimpleWallet {
 impl SimpleWallet {
     #[inline]
     fn new(private_key: SecretKey) -> Self {
-        static SECP256K1: once_cell::sync::Lazy<Secp256k1<secp256k1::All>> = 
-            once_cell::sync::Lazy::new(Secp256k1::new);
+        static SECP256K1: LazyLock<Secp256k1<secp256k1::All>> = 
+            LazyLock::new(Secp256k1::new);
         
         let public_key = PublicKey::from_secret_key(&SECP256K1, &private_key);
         let pub_bytes = public_key.serialize_uncompressed();
@@ -190,7 +191,11 @@ fn save_encrypted_wallet(
     cipher.apply_keystream(&mut ciphertext);
 
     // Calculate MAC (SHA3-256 of derived_key[16..32] + ciphertext)
-    let mac = Keccak256::digest([&derived_key[16..32], &ciphertext].concat());
+    // Use chain() instead of concat() to avoid allocation
+    let mut mac_hasher = Keccak256::new();
+    mac_hasher.update(&derived_key[16..32]);
+    mac_hasher.update(&ciphertext);
+    let mac = mac_hasher.finalize();
 
     // Generate unique ID: timestamp + random
     let id = format!("{:x}-{:x}", 
@@ -227,15 +232,21 @@ fn save_encrypted_wallet(
     Ok(file_path.display().to_string())
 }
 
+#[inline]
 fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
-    hex_str
-        .chars()
-        .map(|c| match c.to_ascii_lowercase() {
-            '0'..='9' => c as u8 - b'0',
-            'a'..='f' => c as u8 - b'a' + 10,
+    // Pre-allocate with exact capacity to avoid reallocations
+    // Use bytes iterator for better performance (ASCII only)
+    let mut nybbles = Vec::with_capacity(hex_str.len());
+    for &byte in hex_str.as_bytes() {
+        let nybble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
             _ => 0,
-        })
-        .collect()
+        };
+        nybbles.push(nybble);
+    }
+    nybbles
 }
 
 fn create_hardware_rng() -> ChaCha20Rng {
@@ -254,12 +265,13 @@ fn hex_encode(data: &[u8]) -> String {
         64 => 128, // SHA3-256 hash
         _ => data.len() * 2, // Fallback for other sizes
     };
-    let mut hex = String::with_capacity(capacity);
+    // Use unsafe construction for better performance - hex digits are always valid ASCII
+    let mut hex_bytes = Vec::with_capacity(capacity);
     for &byte in data {
-        hex.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-        hex.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+        hex_bytes.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+        hex_bytes.push(b"0123456789abcdef"[(byte & 0x0F) as usize]);
     }
-    hex
+    unsafe { String::from_utf8_unchecked(hex_bytes) }
 }
 
 fn generate_random_password(len: usize) -> String {
@@ -268,34 +280,46 @@ fn generate_random_password(len: usize) -> String {
                              0123456789";
     let mut rng = create_hardware_rng();
 
+    // Use unsafe String construction for better performance
+    // CHARSET only contains ASCII, so this is safe
     let mut password = Vec::with_capacity(len);
-    for _ in 0..len {
+    password.resize(len, 0);
+    for byte in &mut password {
         let idx = (rng.next_u32() as usize) % CHARSET.len();
-        password.push(CHARSET[idx]);
+        *byte = CHARSET[idx];
     }
 
-    unsafe { String::from_utf8(password).unwrap_unchecked() }
+    unsafe { String::from_utf8_unchecked(password) }
 }
 
-#[inline]
+#[inline(always)]
 fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
-    let nybble = |i: usize| if i % 2 == 0 { addr[i / 2] >> 4 } else { addr[i / 2] & 0x0F };
+    #[inline(always)]
+    fn nybble(addr: &[u8; 20], i: usize) -> u8 {
+        if i % 2 == 0 { 
+            addr[i / 2] >> 4 
+        } else { 
+            addr[i / 2] & 0x0F 
+        }
+    }
 
-    // Check prefix
+    // Check prefix - early return for better branch prediction
     for (i, &expected) in start_hex.iter().enumerate() {
-        if nybble(i) != expected {
+        if nybble(addr, i) != expected {
             return false;
         }
     }
 
     // Check suffix
     let suffix_len = end_hex.len();
-    let total_nybbles = 40;
-    let suffix_start = total_nybbles - suffix_len;
+    if suffix_len > 0 {
+        let total_nybbles = 40;
+        let suffix_start = total_nybbles - suffix_len;
 
-    for (i, &expected) in end_hex.iter().enumerate() {
-        if nybble(suffix_start + i) != expected {
-            return false;
+        for (i, &expected) in end_hex.iter().enumerate() {
+            if nybble(addr, suffix_start + i) != expected {
+                return false;
+            }
         }
     }
 
@@ -312,6 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Pattern length cannot exceed 40 characters".into());
     }
     
+    // Convert to lowercase once and reuse
     let pattern_start = args.start_pattern.to_lowercase();
     let pattern_end = args.end_pattern.to_lowercase();
     let start_nybbles = hex_to_nybbles(&pattern_start);
@@ -365,8 +390,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     // Create threads manually instead of using rayon
-    let mut handles = Vec::new();
-    for (_i, seed) in seeds.into_iter().enumerate() {
+    let mut handles = Vec::with_capacity(thread_count);
+    for seed in seeds {
         let sender = sender.clone();
         let total_attempts = total_attempts.clone();
         let found_count = found_count.clone();
@@ -377,7 +402,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = password.clone();
         let output_dir = args.output_dir.clone();
         let args_show_full_key = args.show_full_key;
-        let _args_show_mnemonic = args.show_mnemonic;
         let pattern_difficulty = pattern_difficulty;
         
         let handle = thread::spawn(move || {
