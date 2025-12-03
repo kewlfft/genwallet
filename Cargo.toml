@@ -20,8 +20,8 @@ rand_chacha = "0.9"
 getrandom = { version = "0.3", features = ["std"] }
 
 # Utilities
-clap = { version = "4.5.41", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
 rpassword = "7.4.0"
 sha3 = "0.10"
-once_cell = "1.19"
+once_cell = "1.21"
  
