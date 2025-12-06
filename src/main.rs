@@ -6,7 +6,7 @@ use k256::elliptic_curve::BatchNormalize;
 use k256::U256; 
 use k256::elliptic_curve::bigint::Encoding; // Correct path
 
-use rand_chacha::ChaCha20Rng;
+use rand::rngs::StdRng; // Use StdRng (usually ChaCha12)
 use rand::{RngCore, SeedableRng};
 use bip32::XPrv;
 use scrypt::{scrypt, Params as ScryptParams};
@@ -246,10 +246,11 @@ fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
     nybbles
 }
 
-fn create_hardware_rng() -> ChaCha20Rng {
+fn create_hardware_rng() -> StdRng {
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed).expect("Failed to get hardware entropy");
-    ChaCha20Rng::from_seed(seed)
+    // Use rand::rng() which is cryptographically secure and seeded from OS
+    rand::rng().fill_bytes(&mut seed);
+    StdRng::from_seed(seed)
 }
 
 #[inline]
@@ -425,7 +426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pattern_difficulty = pattern_difficulty;
         
         let handle = thread::spawn(move || {
-            let mut rng = ChaCha20Rng::from_seed(seed);
+            let mut rng = StdRng::from_seed(seed);
 
             // Initialize starting point
             let mut private_key_bytes = [0u8; 32];
