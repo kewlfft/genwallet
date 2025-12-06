@@ -1,9 +1,8 @@
 [build]
 rustflags = [
     "-C", "target-cpu=native",
-    "-C", "target-feature=+bmi2,+adx,+aes,+avx2,+fma,+sse4.2",
-    "-C", "codegen-units=1",
-    "-C", "panic=abort",
-    "-C", "strip=symbols"
+    # Optional: Explicitly enabling features is usually redundant with native, 
+    # but we can keep them if you want to be absolutely sure.
+    # "-C", "target-feature=+bmi2,+adx,+aes,+avx2,+fma,+sse4.2" 
 ]
  
