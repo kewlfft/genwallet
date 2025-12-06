@@ -1,6 +1,6 @@
 [package]
 name = "genwallet"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 
 [dependencies]
@@ -23,4 +23,13 @@ getrandom = { version = "0.3", features = ["std"] }
 clap = { version = "4.5.53", features = ["derive"] }
 rpassword = "7.4.0"
 sha3 = "0.10"
- 
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false
+incremental = false
