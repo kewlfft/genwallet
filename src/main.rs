@@ -78,13 +78,6 @@ impl SimpleWallet {
         Self { private_key, address }
     }
     
-    #[inline]
-    fn random(rng: &mut ChaCha20Rng) -> Self {
-        let mut private_key_bytes = [0u8; 32];
-        rng.fill_bytes(&mut private_key_bytes);
-        let private_key = SecretKey::from_byte_array(private_key_bytes).expect("Invalid private key");
-        Self::new(private_key)
-    }
     
     fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, Box<dyn std::error::Error>> {
         let seed = mnemonic.to_seed("");
@@ -528,7 +521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let addr_bytes = wallet.address();
         
             // Update attempt count (for mnemonic path or found path)
-            let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
+            total_attempts.fetch_add(1, Ordering::Relaxed);
             
             // Check match again? No, fast path already checked. 
             // Mnemonic path needs checking.
