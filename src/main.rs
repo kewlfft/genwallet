@@ -382,14 +382,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // Prepare the Generator Point G (Public Key of 1) and Scalar 1
+    // Prepare the Generator Point G (Public Key of 1)
     let one_bytes = [
         0, 0, 0, 0, 0, 0, 0, 0, 
         0, 0, 0, 0, 0, 0, 0, 0, 
         0, 0, 0, 0, 0, 0, 0, 0, 
         0, 0, 0, 0, 0, 0, 0, 1
     ];
-    let scalar_one = Scalar::from_be_bytes(one_bytes).unwrap();
     // We need a Secp context
     static SECP: LazyLock<Secp256k1<secp256k1::All>> = LazyLock::new(Secp256k1::new);
     let g_point = PublicKey::from_secret_key(&SECP, &SecretKey::from_byte_array(one_bytes).unwrap());
@@ -415,7 +414,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Initialize starting point for Step Optimization
             let mut private_key_bytes = [0u8; 32];
             rng.fill_bytes(&mut private_key_bytes);
-            let mut current_sk = SecretKey::from_byte_array(private_key_bytes).unwrap_or_else(|_| {
+            let current_sk = SecretKey::from_byte_array(private_key_bytes).unwrap_or_else(|_| {
                  // Fallback if random bytes are invalid (extremely rare)
                  SecretKey::from_byte_array([1u8; 32]).unwrap()
             });
