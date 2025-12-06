@@ -1,12 +1,11 @@
 [package]
 name = "genwallet"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 
 [dependencies]
-# Core cryptography - ultra minimal dependencies
-# Disable default features to remove unused code (like recovery) for better cache locality
-secp256k1 = { version = "0.31.1", default-features = false, features = ["alloc", "rand", "std"] }
+# Core cryptography - using k256 for batch optimization
+k256 = { version = "0.13", features = ["arithmetic", "std"] }
 bip39 = "2.2"
 bip32 = "0.5.3"
 scrypt = "0.11"

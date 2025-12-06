@@ -1,5 +1,11 @@
 use bip39::Mnemonic;
-use secp256k1::{Secp256k1, SecretKey, PublicKey, Scalar};
+use k256::{SecretKey, Scalar, ProjectivePoint};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::ops::Reduce;
+use k256::elliptic_curve::BatchNormalize;
+use k256::U256; 
+use k256::elliptic_curve::bigint::Encoding; // Correct path
+
 use rand_chacha::ChaCha20Rng;
 use rand::{RngCore, SeedableRng};
 use bip32::XPrv;
@@ -8,7 +14,6 @@ use aes::Aes128;
 use ctr::Ctr32BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use serde::{Serialize, Deserialize};
-use std::sync::LazyLock;
 
 #[derive(Serialize, Deserialize)]
 struct Keystore {
@@ -53,7 +58,7 @@ use std::sync::mpsc;
 use std::thread;
 use sha3::{Keccak256, Digest};
 
-// Simple wallet struct using secp256k1
+// Simple wallet struct using k256
 struct SimpleWallet {
     private_key: SecretKey,
     address: [u8; 20],
@@ -62,11 +67,9 @@ struct SimpleWallet {
 impl SimpleWallet {
     #[inline]
     fn new(private_key: SecretKey) -> Self {
-        static SECP256K1: LazyLock<Secp256k1<secp256k1::All>> = 
-            LazyLock::new(Secp256k1::new);
-        
-        let public_key = PublicKey::from_secret_key(&SECP256K1, &private_key);
-        let pub_bytes = public_key.serialize_uncompressed();
+        let public_key = private_key.public_key();
+        let pub_point = public_key.to_encoded_point(false);
+        let pub_bytes = pub_point.as_bytes();
 
         let mut hasher = Keccak256::new();
         hasher.update(&pub_bytes[1..]);
@@ -92,7 +95,8 @@ impl SimpleWallet {
         xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
         xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
         
-        let private_key = SecretKey::from_byte_array(xprv.to_bytes())?;
+        // bip32 XPrv returns bytes that need conversion to k256::SecretKey
+        let private_key = SecretKey::from_slice(&xprv.to_bytes())?;
         Ok(Self::new(private_key))
     }
     
@@ -103,7 +107,7 @@ impl SimpleWallet {
     
     #[inline]
     fn to_bytes(&self) -> [u8; 32] {
-        self.private_key.secret_bytes()
+        self.private_key.to_bytes().into()
     }
 }
 
@@ -286,7 +290,20 @@ fn generate_random_password(len: usize) -> String {
 }
 
 #[inline(always)]
-fn match_prefix_suffix_bytes(addr: &[u8], start_hex: &[u8], end_hex: &[u8]) -> bool {
+fn match_prefix_suffix_bytes(
+    addr: &[u8], 
+    start_hex: &[u8], 
+    end_hex: &[u8],
+    fast_fail: Option<u8>
+) -> bool {
+    // Fast fail optimization: Check first byte directly
+    // This avoids loop setup and bitwise ops for 99.6% of non-matches
+    if let Some(expected) = fast_fail {
+        if addr[0] != expected {
+            return false;
+        }
+    }
+
     #[inline(always)]
     fn nybble(addr: &[u8], i: usize) -> u8 {
         if i % 2 == 0 { 
@@ -296,7 +313,7 @@ fn match_prefix_suffix_bytes(addr: &[u8], start_hex: &[u8], end_hex: &[u8]) -> b
         }
     }
 
-    // Check prefix - early return for better branch prediction
+    // Check prefix
     for (i, &expected) in start_hex.iter().enumerate() {
         if nybble(addr, i) != expected {
             return false;
@@ -334,6 +351,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pattern_end = args.end_pattern.to_lowercase();
     let start_nybbles = hex_to_nybbles(&pattern_start);
     let end_nybbles = hex_to_nybbles(&pattern_end);
+    
+    // Pre-calculate fast fail byte (first 2 nybbles)
+    let fast_fail_byte = if start_nybbles.len() >= 2 {
+        Some((start_nybbles[0] << 4) | start_nybbles[1])
+    } else {
+        None
+    };
 
     let pattern_difficulty = if !pattern_start.is_empty() && !pattern_end.is_empty() {
         16.0_f64.powi((pattern_start.len() + pattern_end.len()) as i32)
@@ -382,16 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // Prepare the Generator Point G (Public Key of 1)
-    let one_bytes = [
-        0, 0, 0, 0, 0, 0, 0, 0, 
-        0, 0, 0, 0, 0, 0, 0, 0, 
-        0, 0, 0, 0, 0, 0, 0, 0, 
-        0, 0, 0, 0, 0, 0, 0, 1
-    ];
-    // We need a Secp context
-    static SECP: LazyLock<Secp256k1<secp256k1::All>> = LazyLock::new(Secp256k1::new);
-    let g_point = PublicKey::from_secret_key(&SECP, &SecretKey::from_byte_array(one_bytes).unwrap());
+    // Prepare the Generator Point G
+    let g_point = ProjectivePoint::GENERATOR;
 
     // Create threads manually instead of using rayon
     let mut handles = Vec::with_capacity(thread_count);
@@ -411,41 +427,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = thread::spawn(move || {
             let mut rng = ChaCha20Rng::from_seed(seed);
 
-            // Initialize starting point for Step Optimization
+            // Initialize starting point
             let mut private_key_bytes = [0u8; 32];
             rng.fill_bytes(&mut private_key_bytes);
-            let current_sk = SecretKey::from_byte_array(private_key_bytes).unwrap_or_else(|_| {
-                 // Fallback if random bytes are invalid (extremely rare)
-                 SecretKey::from_byte_array([1u8; 32]).unwrap()
-            });
-            let initial_sk = current_sk;
-            let mut current_pk = PublicKey::from_secret_key(&SECP, &current_sk);
             
-            // Reuse Keccak hasher to avoid allocation
+            // Ensure valid scalar
+            let current_sk = SecretKey::from_slice(&private_key_bytes).unwrap_or_else(|_| {
+                 SecretKey::from_slice(&[1u8; 32]).unwrap()
+            });
+            let initial_sk = current_sk.clone();
+            
+            // Convert to ProjectivePoint for fast addition
+            let mut current_point = ProjectivePoint::from(current_sk.public_key());
+            
+            // Reuse Keccak hasher
             let mut hasher = Keccak256::new();
             
-            // Local counters to reduce atomic contention
+            // Local counters
             let mut local_steps: u64 = 0;
-            const BATCH_SIZE: u64 = 2048;
+            const BATCH_SIZE: usize = 2048; // Stable peak amortization without cache thrashing
+            const REPORT_BATCH_SIZE: u64 = 65536; // Reduced contention (approx 1 update every ~2s per thread)
+
+            // Pre-calculate increments: 1G, 2G, ... 32G as AffinePoints for mixed addition
+            // Adding Affine to Projective is faster than Projective + Projective
+            let mut increments = Vec::with_capacity(BATCH_SIZE);
+            let mut curr_g = g_point;
+            for _ in 0..BATCH_SIZE {
+                increments.push(curr_g.to_affine()); // Store as Affine
+                curr_g += g_point;
+            }
+            // curr_g is now (BATCH_SIZE + 1)G, but we want step_batch_g = BATCH_SIZE * G
+            // The last element in increments is exactly BATCH_SIZE * G
+            let step_batch_g = ProjectivePoint::from(*increments.last().unwrap());
 
             loop {
                 // Batch reporting and check
-                if local_steps % BATCH_SIZE == 0 && local_steps > 0 {
-                    total_attempts.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                if local_steps % REPORT_BATCH_SIZE == 0 && local_steps > 0 {
+                    total_attempts.fetch_add(REPORT_BATCH_SIZE, Ordering::Relaxed);
                     
-                    // Check if we are done
                     if found_count.load(Ordering::Acquire) >= args_count {
                         break;
                     }
 
                     // Progress printing (approximate)
                     let current_global = total_attempts.load(Ordering::Relaxed);
-                    if current_global % progress_interval < BATCH_SIZE {
+                    if current_global % progress_interval < REPORT_BATCH_SIZE {
+                        // ... existing progress code ...
                         let elapsed = start_time.elapsed();
                         let rate = current_global as f64 / elapsed.as_secs_f64();
                         let found = found_count.load(Ordering::Relaxed);
                         
-                        // ETA logic...
                         let remaining_wallets = args_count.saturating_sub(found);
                         let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
                             let attempts_per_wallet = current_global as f64 / found as f64;
@@ -482,105 +513,126 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Return Option<(Wallet, Option<Mnemonic>)> 
-                let step_result = if args_show_mnemonic {
-                    // Mnemonic path - slow path
+                if args_show_mnemonic {
+                    // Mnemonic path (slow, no batching needed)
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
+                    if let Ok(mnemonic) = Mnemonic::from_entropy(&entropy) {
+                        if let Ok(wallet) = SimpleWallet::from_mnemonic(&mnemonic) {
+                            let addr_bytes = wallet.address();
+                            if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
+                                // Found via mnemonic!
+                                // ... handle success ...
+                                let addr_hex = hex_encode(&addr_bytes);
+                                let private_key_bytes = wallet.to_bytes();
 
-                    match Mnemonic::from_entropy(&entropy) {
-                        Ok(mnemonic) => {
-                            match SimpleWallet::from_mnemonic(&mnemonic) {
-                                Ok(wallet) => Some((wallet, Some(mnemonic))),
-                                Err(_) => None,
-                            }
-                        },
-                        Err(_) => None,
-                    }
-                } else {
-                    // Fast path - Step Optimization
-                    
-                    // 1. Serialize Public Key (Compressed or Uncompressed)
-                    let pub_bytes = current_pk.serialize_uncompressed();
-
-                    // 2. Keccak256 Hash to get address - reusing hasher
-                    hasher.update(&pub_bytes[1..]);
-                    let hash = hasher.finalize_reset();
-                    
-                    // 3. Check Match - pass slice directly
-                    let addr_bytes = &hash[12..];
-                    
-                    if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles) {
-                         // Reconstruct private key only when match found
-                         let mut steps_bytes = [0u8; 32];
-                         steps_bytes[24..].copy_from_slice(&local_steps.to_be_bytes());
-                         let scalar_steps = Scalar::from_be_bytes(steps_bytes).unwrap();
-                         let matched_sk = initial_sk.add_tweak(&scalar_steps).unwrap();
-                         let wallet = SimpleWallet::new(matched_sk);
-                         Some((wallet, None))
-                    } else {
-                        // 4. STEP: Add G to Public Key
-                        current_pk = current_pk.combine(&g_point).expect("Point addition failed");
-                        None 
-                    }
-                };
-
-                // Increment steps/attempts
-                local_steps += 1;
-
-                // Handle the result
-                let (wallet, mnemonic) = match step_result {
-                    Some((w, m)) => (w, m),
-                    None => continue,
-                };
-
-                let addr_bytes = wallet.address();
-        
-                // Check match again for mnemonic path (fast path already checked)
-                let is_match = if args_show_mnemonic {
-                     match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles)
-                } else {
-                     true
-                };
-
-                if is_match {
-                    let addr_hex = hex_encode(&addr_bytes);
-                    let private_key_bytes = wallet.to_bytes();
-
-                    let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                    if idx < args_count {
-                        match save_encrypted_wallet(&wallet, &password, &output_dir) {
-                            Ok(path) => {
-                                println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
-                                println!("Address:    0x{}", addr_hex);
-                                if args_show_full_key {
-                                    println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                } else {
-                                    println!(
-                                        "PrivateKey: {}",
-                                        redact_private_key(&hex_encode(&private_key_bytes))
-                                    );
-                                }
-                                if args_show_mnemonic {
-                                    if let Some(m) = mnemonic {
-                                        println!("Mnemonic:   {}", m.to_string());
+                                let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                                if idx < args_count {
+                                    match save_encrypted_wallet(&wallet, &password, &output_dir) {
+                                        Ok(path) => {
+                                            println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
+                                            println!("Address:    0x{}", addr_hex);
+                                            println!("PrivateKey: {}", hex_encode(&private_key_bytes));
+                                            println!("Mnemonic:   {}", mnemonic.to_string());
+                                            println!("Saved to:   {}", path);
+                                            println!("---");
+                                            sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
+                                        }
+                                        Err(e) => eprintln!("Error: {}", e),
                                     }
-                                }
-                                println!("Saved to:   {}", path);
-                                println!("---");
-
-                                sender.send((addr_hex, hex_encode(&private_key_bytes), path))
-                                    .ok();
-                            }
-                            Err(e) => {
-                                eprintln!("Error saving encrypted wallet: {}", e);
+                                } else { break; }
                             }
                         }
+                    }
+                    local_steps += 1;
+                    continue;
+                }
+
+                // Fast Path: Batch Optimization
+                
+                // 1. Generate batch of 8 points: P, P+G, ..., P+7G
+                // We actually want P+0, P+1, ... P+7
+                // But current_point is P.
+                // We add our pre-calc increments.
+                let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
+                // Manually unroll or loop? Loop is fine, compiler unrolls.
+                for i in 0..BATCH_SIZE {
+                    // This is (Base + i*G) - we precalculated i*G (1-based), 
+                    // so we need 0-based.
+                    // P_0 = current_point
+                    // P_i = current_point + increments[i-1] (where increments are Affine)
+                    if i == 0 {
+                        batch_points[0] = current_point;
                     } else {
-                        // Another thread finished the job
-                        break;
+                        batch_points[i] = current_point + increments[i-1];
                     }
                 }
+
+                // 2. Batch Normalize (THE KEY SPEEDUP)
+                // Converts all 8 Projective points to Affine points with 1 inversion
+                let affine_points = ProjectivePoint::batch_normalize(&batch_points);
+
+                // 3. Process batch
+                for (i, point) in affine_points.iter().enumerate() {
+                    // Access coordinates via ToEncodedPoint (robust)
+                    let encoded = point.to_encoded_point(false);
+                    let x = encoded.x().unwrap();
+                    let y = encoded.y().unwrap();
+                    
+                    // Keccak-256 hash of (X || Y)
+                    hasher.update(x);
+                    hasher.update(y);
+                    let hash = hasher.finalize_reset();
+                    let addr_bytes = &hash[12..];
+
+                    if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
+                        // Found match! Reconstruct Private Key
+                        let offset = local_steps + i as u64;
+                        let mut steps_bytes = [0u8; 32];
+                        steps_bytes[24..].copy_from_slice(&offset.to_be_bytes());
+                        
+                        // Convert offset to Scalar
+                        let offset_uint = U256::from_be_bytes(steps_bytes);
+                        // Use reduce to ensure it fits in field
+                        let scalar = <Scalar as Reduce<U256>>::reduce(offset_uint);
+                        
+                        // Add scalar to secret key: sk_new = sk + offset
+                        let sk_scalar = initial_sk.to_nonzero_scalar();
+                        let matched_scalar = sk_scalar.as_ref() + scalar;
+                        let matched_sk = SecretKey::new(matched_scalar.into());
+                        
+                        let wallet = SimpleWallet::new(matched_sk);
+                        
+                        let addr_hex = hex_encode(&addr_bytes);
+                        let private_key_bytes = wallet.to_bytes();
+
+                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                        if idx < args_count {
+                            match save_encrypted_wallet(&wallet, &password, &output_dir) {
+                                Ok(path) => {
+                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
+                                    println!("Address:    0x{}", addr_hex);
+                                    if args_show_full_key {
+                                        println!("PrivateKey: {}", hex_encode(&private_key_bytes));
+                                    } else {
+                                        println!("PrivateKey: {}", redact_private_key(&hex_encode(&private_key_bytes)));
+                                    }
+                                    println!("Saved to:   {}", path);
+                                    println!("---");
+                                    sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
+                                }
+                                Err(e) => eprintln!("Error: {}", e),
+                            }
+                        } else {
+                            // Another thread finished
+                            return; // Break outer loop
+                        }
+                    }
+                }
+
+                // Advance base point by batch size for next batch
+                current_point += step_batch_g;
+                local_steps += BATCH_SIZE as u64;
             }
         });
         handles.push(handle);
