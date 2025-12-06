@@ -395,7 +395,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_attempts = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
-    let progress_interval = if args.show_mnemonic { 10_000 } else { 100_000 };
+    // Increase update interval to avoid flickering (1M attempts)
+    let progress_interval = if args.show_mnemonic { 10_000 } else { 1_000_000 };
 
     // Create seeds once using hardware entropy
     let mut master_rng = create_hardware_rng();
@@ -447,7 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Local counters
             let mut local_steps: u64 = 0;
             const BATCH_SIZE: usize = 2048; // Stable peak amortization without cache thrashing
-            const REPORT_BATCH_SIZE: u64 = 65536; // Reduced contention (approx 1 update every ~2s per thread)
+            const REPORT_BATCH_SIZE: u64 = 262_144; // Reduced contention (~250k steps)
 
             // Pre-calculate increments: 1G, 2G, ... 32G as AffinePoints for mixed addition
             // Adding Affine to Projective is faster than Projective + Projective
