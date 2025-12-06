@@ -1,5 +1,5 @@
 use bip39::Mnemonic;
-use secp256k1::{Secp256k1, SecretKey, PublicKey};
+use secp256k1::{Secp256k1, SecretKey, PublicKey, Scalar};
 use rand_chacha::ChaCha20Rng;
 use rand::{RngCore, SeedableRng};
 use bip32::XPrv;
@@ -389,6 +389,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    // Prepare the Generator Point G (Public Key of 1) and Scalar 1
+    let one_bytes = [
+        0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 0, 
+        0, 0, 0, 0, 0, 0, 0, 1
+    ];
+    let scalar_one = Scalar::from_be_bytes(one_bytes).unwrap();
+    // We need a Secp context
+    static SECP: LazyLock<Secp256k1<secp256k1::All>> = LazyLock::new(Secp256k1::new);
+    let g_point = PublicKey::from_secret_key(&SECP, &SecretKey::from_byte_array(one_bytes).unwrap());
+
     // Create threads manually instead of using rayon
     let mut handles = Vec::with_capacity(thread_count);
     for seed in seeds {
@@ -407,9 +419,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let handle = thread::spawn(move || {
             let mut rng = ChaCha20Rng::from_seed(seed);
 
+            // Initialize starting point for Step Optimization
+            let mut private_key_bytes = [0u8; 32];
+            rng.fill_bytes(&mut private_key_bytes);
+            let mut current_sk = SecretKey::from_byte_array(private_key_bytes).unwrap_or_else(|_| {
+                 // Fallback if random bytes are invalid (extremely rare)
+                 SecretKey::from_byte_array([1u8; 32]).unwrap()
+            });
+            let mut current_pk = PublicKey::from_secret_key(&SECP, &current_sk);
+
             while found_count.load(Ordering::Acquire) < args_count {
-                let (wallet, mnemonic) = if args_show_mnemonic {
-                    // Mnemonic path - generate entropy and create wallet from mnemonic
+                // Return Option<(Wallet, Option<Mnemonic>)> 
+                // Some(...) -> Found potential match or mnemonic generated
+                // None -> Fast path continued, loop again
+                let step_result = if args_show_mnemonic {
+                    // Mnemonic path - CANNOT use step optimization because mnemonic must match key
+                    // generate entropy and create wallet from mnemonic
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
 
@@ -423,57 +448,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(_) => continue,
                     };
 
-                    (wallet, Some(mnemonic))
+                    Some((wallet, Some(mnemonic)))
                 } else {
-                    // Fast path - direct wallet generation
-                    (SimpleWallet::random(&mut rng), None)
+                    // Fast path - Step Optimization
+                    
+                    // 1. Serialize Public Key (Compressed or Uncompressed)
+                    // Ethereum uses uncompressed public key (minus the 04 prefix) for hashing
+                    let pub_bytes = current_pk.serialize_uncompressed();
+
+                    // 2. Keccak256 Hash to get address
+                    let mut hasher = Keccak256::new();
+                    hasher.update(&pub_bytes[1..]);
+                    let hash = hasher.finalize();
+                    let mut addr_bytes = [0u8; 20];
+                    addr_bytes.copy_from_slice(&hash[12..]);
+
+                    // 3. Check Match
+                    if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
+                         let wallet = SimpleWallet::new(current_sk);
+                         Some((wallet, None))
+                    } else {
+                        // 4. STEP: Add G to Public Key and 1 to Private Key
+                        current_pk = current_pk.combine(&g_point).expect("Point addition failed");
+                        current_sk = current_sk.add_tweak(&scalar_one).expect("Scalar tweak failed");
+                        
+                        // Update attempt count and continue
+                        let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
+                         if current_attempts % progress_interval == 0 {
+                            let elapsed = start_time.elapsed();
+                            let rate = current_attempts as f64 / elapsed.as_secs_f64();
+                            let found = found_count.load(Ordering::Relaxed);
+
+                            let remaining_wallets = args_count.saturating_sub(found);
+                            let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
+                                let attempts_per_wallet = current_attempts as f64 / found as f64;
+                                let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
+                                remaining_attempts / rate
+                            } else if rate > 0.0 && remaining_wallets > 0 {
+                                let estimated_attempts_per_wallet = pattern_difficulty;
+                                let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
+                                remaining_attempts / rate
+                            } else {
+                                0.0
+                            };
+
+                            let eta_str = if eta_seconds > 0.0 {
+                                if eta_seconds < 60.0 {
+                                    format!("{:.0}s", eta_seconds)
+                                } else if eta_seconds < 3600.0 {
+                                    format!("{:.0}m", eta_seconds / 60.0)
+                                } else {
+                                    format!("{:.1}h", eta_seconds / 3600.0)
+                                }
+                            } else {
+                                "∞".to_string()
+                            };
+
+                            print!(
+                                "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
+                                current_attempts / 1_000_000,
+                                found,
+                                args_count,
+                                rate / 1_000.0,
+                                eta_str
+                            );
+                        }
+                        
+                        // Continue the loop inside if
+                        None 
+                    }
+                };
+
+                // Handle the result from fast/mnemonic path
+                let (wallet, mnemonic) = match step_result {
+                    Some((w, m)) => (w, m),
+                    None => continue, // Step optimized path continued internally
                 };
 
                 let addr_bytes = wallet.address();
+        
+            // Update attempt count (for mnemonic path or found path)
+            let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
             
-                // Update attempt count
-                let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
-                if current_attempts % progress_interval == 0 {
-                    let elapsed = start_time.elapsed();
-                    let rate = current_attempts as f64 / elapsed.as_secs_f64();
-                    let found = found_count.load(Ordering::Relaxed);
+            // Check match again? No, fast path already checked. 
+            // Mnemonic path needs checking.
+            let is_match = if args_show_mnemonic {
+                 match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles)
+            } else {
+                 // Fast path already checked and returned true to get here
+                 true
+            };
 
-                    let remaining_wallets = args_count.saturating_sub(found);
-                    let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
-                        let attempts_per_wallet = current_attempts as f64 / found as f64;
-                        let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
-                        remaining_attempts / rate
-                    } else if rate > 0.0 && remaining_wallets > 0 {
-                        let estimated_attempts_per_wallet = pattern_difficulty;
-                        let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
-                        remaining_attempts / rate
-                    } else {
-                        0.0
-                    };
-
-                    let eta_str = if eta_seconds > 0.0 {
-                        if eta_seconds < 60.0 {
-                            format!("{:.0}s", eta_seconds)
-                        } else if eta_seconds < 3600.0 {
-                            format!("{:.0}m", eta_seconds / 60.0)
-                        } else {
-                            format!("{:.1}h", eta_seconds / 3600.0)
-                        }
-                    } else {
-                        "∞".to_string()
-                    };
-
-                    print!(
-                        "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
-                        current_attempts / 1_000_000,
-                        found,
-                        args_count,
-                        rate / 1_000.0,
-                        eta_str
-                    );
-                }
-
-                if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
+            if is_match {
                     let addr_hex = hex_encode(&addr_bytes);
                     let private_key_bytes = wallet.to_bytes();
 
@@ -507,10 +573,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error saving encrypted wallet: {}", e);
                             }
                         }
-                    } else {
-                        break;
                     }
                 }
+            // No break here - the loop condition will handle it
             }
         });
         handles.push(handle);
