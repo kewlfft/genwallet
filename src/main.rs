@@ -286,9 +286,9 @@ fn generate_random_password(len: usize) -> String {
 }
 
 #[inline(always)]
-fn match_prefix_suffix_bytes(addr: &[u8; 20], start_hex: &[u8], end_hex: &[u8]) -> bool {
+fn match_prefix_suffix_bytes(addr: &[u8], start_hex: &[u8], end_hex: &[u8]) -> bool {
     #[inline(always)]
-    fn nybble(addr: &[u8; 20], i: usize) -> u8 {
+    fn nybble(addr: &[u8], i: usize) -> u8 {
         if i % 2 == 0 { 
             addr[i / 2] >> 4 
         } else { 
@@ -419,120 +419,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  // Fallback if random bytes are invalid (extremely rare)
                  SecretKey::from_byte_array([1u8; 32]).unwrap()
             });
+            let initial_sk = current_sk;
             let mut current_pk = PublicKey::from_secret_key(&SECP, &current_sk);
+            
+            // Reuse Keccak hasher to avoid allocation
+            let mut hasher = Keccak256::new();
+            
+            // Local counters to reduce atomic contention
+            let mut local_steps: u64 = 0;
+            const BATCH_SIZE: u64 = 2048;
 
-            while found_count.load(Ordering::Acquire) < args_count {
+            loop {
+                // Batch reporting and check
+                if local_steps % BATCH_SIZE == 0 && local_steps > 0 {
+                    total_attempts.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                    
+                    // Check if we are done
+                    if found_count.load(Ordering::Acquire) >= args_count {
+                        break;
+                    }
+
+                    // Progress printing (approximate)
+                    let current_global = total_attempts.load(Ordering::Relaxed);
+                    if current_global % progress_interval < BATCH_SIZE {
+                        let elapsed = start_time.elapsed();
+                        let rate = current_global as f64 / elapsed.as_secs_f64();
+                        let found = found_count.load(Ordering::Relaxed);
+                        
+                        // ETA logic...
+                        let remaining_wallets = args_count.saturating_sub(found);
+                        let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
+                            let attempts_per_wallet = current_global as f64 / found as f64;
+                            let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
+                        } else if rate > 0.0 && remaining_wallets > 0 {
+                            let estimated_attempts_per_wallet = pattern_difficulty;
+                            let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
+                            remaining_attempts / rate
+                        } else {
+                            0.0
+                        };
+
+                        let eta_str = if eta_seconds > 0.0 {
+                            if eta_seconds < 60.0 {
+                                format!("{:.0}s", eta_seconds)
+                            } else if eta_seconds < 3600.0 {
+                                format!("{:.0}m", eta_seconds / 60.0)
+                            } else {
+                                format!("{:.1}h", eta_seconds / 3600.0)
+                            }
+                        } else {
+                            "∞".to_string()
+                        };
+
+                        print!(
+                            "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
+                            current_global / 1_000_000,
+                            found,
+                            args_count,
+                            rate / 1_000.0,
+                            eta_str
+                        );
+                    }
+                }
+
                 // Return Option<(Wallet, Option<Mnemonic>)> 
-                // Some(...) -> Found potential match or mnemonic generated
-                // None -> Fast path continued, loop again
                 let step_result = if args_show_mnemonic {
-                    // Mnemonic path - CANNOT use step optimization because mnemonic must match key
-                    // generate entropy and create wallet from mnemonic
+                    // Mnemonic path - slow path
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
 
-                    let mnemonic = match Mnemonic::from_entropy(&entropy) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-
-                    let wallet = match SimpleWallet::from_mnemonic(&mnemonic) {
-                        Ok(w) => w,
-                        Err(_) => continue,
-                    };
-
-                    Some((wallet, Some(mnemonic)))
+                    match Mnemonic::from_entropy(&entropy) {
+                        Ok(mnemonic) => {
+                            match SimpleWallet::from_mnemonic(&mnemonic) {
+                                Ok(wallet) => Some((wallet, Some(mnemonic))),
+                                Err(_) => None,
+                            }
+                        },
+                        Err(_) => None,
+                    }
                 } else {
                     // Fast path - Step Optimization
                     
                     // 1. Serialize Public Key (Compressed or Uncompressed)
-                    // Ethereum uses uncompressed public key (minus the 04 prefix) for hashing
                     let pub_bytes = current_pk.serialize_uncompressed();
 
-                    // 2. Keccak256 Hash to get address
-                    let mut hasher = Keccak256::new();
+                    // 2. Keccak256 Hash to get address - reusing hasher
                     hasher.update(&pub_bytes[1..]);
-                    let hash = hasher.finalize();
-                    let mut addr_bytes = [0u8; 20];
-                    addr_bytes.copy_from_slice(&hash[12..]);
-
-                    // 3. Check Match
-                    if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles) {
-                         let wallet = SimpleWallet::new(current_sk);
+                    let hash = hasher.finalize_reset();
+                    
+                    // 3. Check Match - pass slice directly
+                    let addr_bytes = &hash[12..];
+                    
+                    if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles) {
+                         // Reconstruct private key only when match found
+                         let mut steps_bytes = [0u8; 32];
+                         steps_bytes[24..].copy_from_slice(&local_steps.to_be_bytes());
+                         let scalar_steps = Scalar::from_be_bytes(steps_bytes).unwrap();
+                         let matched_sk = initial_sk.add_tweak(&scalar_steps).unwrap();
+                         let wallet = SimpleWallet::new(matched_sk);
                          Some((wallet, None))
                     } else {
-                        // 4. STEP: Add G to Public Key and 1 to Private Key
+                        // 4. STEP: Add G to Public Key
                         current_pk = current_pk.combine(&g_point).expect("Point addition failed");
-                        current_sk = current_sk.add_tweak(&scalar_one).expect("Scalar tweak failed");
-                        
-                        // Update attempt count and continue
-                        let current_attempts = total_attempts.fetch_add(1, Ordering::Relaxed);
-                         if current_attempts % progress_interval == 0 {
-                            let elapsed = start_time.elapsed();
-                            let rate = current_attempts as f64 / elapsed.as_secs_f64();
-                            let found = found_count.load(Ordering::Relaxed);
-
-                            let remaining_wallets = args_count.saturating_sub(found);
-                            let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
-                                let attempts_per_wallet = current_attempts as f64 / found as f64;
-                                let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
-                                remaining_attempts / rate
-                            } else if rate > 0.0 && remaining_wallets > 0 {
-                                let estimated_attempts_per_wallet = pattern_difficulty;
-                                let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
-                                remaining_attempts / rate
-                            } else {
-                                0.0
-                            };
-
-                            let eta_str = if eta_seconds > 0.0 {
-                                if eta_seconds < 60.0 {
-                                    format!("{:.0}s", eta_seconds)
-                                } else if eta_seconds < 3600.0 {
-                                    format!("{:.0}m", eta_seconds / 60.0)
-                                } else {
-                                    format!("{:.1}h", eta_seconds / 3600.0)
-                                }
-                            } else {
-                                "∞".to_string()
-                            };
-
-                            print!(
-                                "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
-                                current_attempts / 1_000_000,
-                                found,
-                                args_count,
-                                rate / 1_000.0,
-                                eta_str
-                            );
-                        }
-                        
-                        // Continue the loop inside if
                         None 
                     }
                 };
 
-                // Handle the result from fast/mnemonic path
+                // Increment steps/attempts
+                local_steps += 1;
+
+                // Handle the result
                 let (wallet, mnemonic) = match step_result {
                     Some((w, m)) => (w, m),
-                    None => continue, // Step optimized path continued internally
+                    None => continue,
                 };
 
                 let addr_bytes = wallet.address();
         
-            // Update attempt count (for mnemonic path or found path)
-            total_attempts.fetch_add(1, Ordering::Relaxed);
-            
-            // Check match again? No, fast path already checked. 
-            // Mnemonic path needs checking.
-            let is_match = if args_show_mnemonic {
-                 match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles)
-            } else {
-                 // Fast path already checked and returned true to get here
-                 true
-            };
+                // Check match again for mnemonic path (fast path already checked)
+                let is_match = if args_show_mnemonic {
+                     match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles)
+                } else {
+                     true
+                };
 
-            if is_match {
+                if is_match {
                     let addr_hex = hex_encode(&addr_bytes);
                     let private_key_bytes = wallet.to_bytes();
 
@@ -551,7 +563,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
                                 if args_show_mnemonic {
-                                    // Display the stored mnemonic
                                     if let Some(m) = mnemonic {
                                         println!("Mnemonic:   {}", m.to_string());
                                     }
@@ -566,9 +577,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("Error saving encrypted wallet: {}", e);
                             }
                         }
+                    } else {
+                        // Another thread finished the job
+                        break;
                     }
                 }
-            // No break here - the loop condition will handle it
             }
         });
         handles.push(handle);
