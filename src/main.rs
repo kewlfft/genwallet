@@ -337,6 +337,18 @@ fn match_prefix_suffix_bytes(
     true
 }
 
+fn format_metric(n: f64) -> String {
+    if n >= 1e9 {
+        format!("{:.2}G", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.2}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.2}k", n / 1e3)
+    } else {
+        format!("{:.0}", n)
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     
@@ -395,8 +407,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_attempts = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
-    // Increase update interval to avoid flickering (1M attempts)
-    let progress_interval = if args.show_mnemonic { 10_000 } else { 1_000_000 };
 
     // Create seeds once using hardware entropy
     let mut master_rng = create_hardware_rng();
@@ -408,10 +418,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // Prepare the Generator Point G
-    let g_point = ProjectivePoint::GENERATOR;
+    // Monitor thread for progress reporting
+    let monitor_found = found_count.clone();
+    let monitor_attempts = total_attempts.clone();
+    let monitor_start = Instant::now();
+    let monitor_args_count = args.count;
+    let monitor_difficulty = pattern_difficulty;
+    
+    thread::spawn(move || {
+        let mut last_attempts = 0;
+        let mut last_time = Instant::now();
+        
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            
+            let current_found = monitor_found.load(Ordering::Relaxed);
+            if current_found >= monitor_args_count {
+                break;
+            }
+            
+            let current_attempts = monitor_attempts.load(Ordering::Relaxed);
+            let total_elapsed = monitor_start.elapsed();
+            let step_elapsed = last_time.elapsed();
+            
+            let delta_attempts = current_attempts.saturating_sub(last_attempts);
+            let instant_rate = delta_attempts as f64 / step_elapsed.as_secs_f64();
+            let avg_rate = current_attempts as f64 / total_elapsed.as_secs_f64();
+            
+            // ETA logic based on INSTANT rate
+            let remaining_wallets = monitor_args_count.saturating_sub(current_found);
+            let eta_seconds = if instant_rate > 0.0 && remaining_wallets > 0 {
+                let attempts_per_wallet = if current_found > 0 {
+                    current_attempts as f64 / current_found as f64
+                } else {
+                    monitor_difficulty
+                };
+                (attempts_per_wallet * remaining_wallets as f64) / instant_rate
+            } else {
+                0.0
+            };
+
+            let eta_str = if eta_seconds > 0.0 {
+                if eta_seconds < 60.0 {
+                    format!("{:.0}s", eta_seconds)
+                } else if eta_seconds < 3600.0 {
+                    format!("{:.0}m", eta_seconds / 60.0)
+                } else {
+                    format!("{:.1}h", eta_seconds / 3600.0)
+                }
+            } else {
+                "∞".to_string()
+            };
+
+            print!(
+                "\r[Progress] Attempts: {} | Found: {}/{} | Speed: {}/s (Avg: {}/s) | ETA: {}   ",
+                format_metric(current_attempts as f64),
+                current_found,
+                monitor_args_count,
+                format_metric(instant_rate),
+                format_metric(avg_rate),
+                eta_str
+            );
+            
+            last_attempts = current_attempts;
+            last_time = Instant::now();
+        }
+    });
 
     // Create threads manually instead of using rayon
+    let g_point = ProjectivePoint::GENERATOR;
     let mut handles = Vec::with_capacity(thread_count);
     for seed in seeds {
         let sender = sender.clone();
@@ -424,7 +499,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = password.clone();
         let output_dir = args.output_dir.clone();
         let args_show_full_key = args.show_full_key;
-        let pattern_difficulty = pattern_difficulty;
         
         let handle = thread::spawn(move || {
             let mut rng = StdRng::from_seed(seed);
@@ -470,49 +544,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if found_count.load(Ordering::Acquire) >= args_count {
                         break;
                     }
-
-                    // Progress printing (approximate)
-                    let current_global = total_attempts.load(Ordering::Relaxed);
-                    if current_global % progress_interval < REPORT_BATCH_SIZE {
-                        // ... existing progress code ...
-                        let elapsed = start_time.elapsed();
-                        let rate = current_global as f64 / elapsed.as_secs_f64();
-                        let found = found_count.load(Ordering::Relaxed);
-                        
-                        let remaining_wallets = args_count.saturating_sub(found);
-                        let eta_seconds = if rate > 0.0 && remaining_wallets > 0 && found > 0 {
-                            let attempts_per_wallet = current_global as f64 / found as f64;
-                            let remaining_attempts = attempts_per_wallet * remaining_wallets as f64;
-                            remaining_attempts / rate
-                        } else if rate > 0.0 && remaining_wallets > 0 {
-                            let estimated_attempts_per_wallet = pattern_difficulty;
-                            let remaining_attempts = estimated_attempts_per_wallet * remaining_wallets as f64;
-                            remaining_attempts / rate
-                        } else {
-                            0.0
-                        };
-
-                        let eta_str = if eta_seconds > 0.0 {
-                            if eta_seconds < 60.0 {
-                                format!("{:.0}s", eta_seconds)
-                            } else if eta_seconds < 3600.0 {
-                                format!("{:.0}m", eta_seconds / 60.0)
-                            } else {
-                                format!("{:.1}h", eta_seconds / 3600.0)
-                            }
-                        } else {
-                            "∞".to_string()
-                        };
-
-                        print!(
-                            "\rAttempts: {}M, Found: {}/{}, Rate: {:.0}K/s, ETA: {}",
-                            current_global / 1_000_000,
-                            found,
-                            args_count,
-                            rate / 1_000.0,
-                            eta_str
-                        );
-                    }
                 }
 
                 if args_show_mnemonic {
@@ -541,7 +572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
                                         }
                                         Err(e) => eprintln!("Error: {}", e),
-                                    }
+                            }
                                 } else { break; }
                             }
                         }
@@ -565,7 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // P_i = current_point + increments[i-1] (where increments are Affine)
                     if i == 0 {
                         batch_points[0] = current_point;
-                    } else {
+                } else {
                         batch_points[i] = current_point + increments[i-1];
                     }
                 }
@@ -580,17 +611,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let encoded = point.to_encoded_point(false);
                     let x = encoded.x().unwrap();
                     let y = encoded.y().unwrap();
-                    
+
                     // Keccak-256 hash of (X || Y)
                     hasher.update(x);
                     hasher.update(y);
                     let hash = hasher.finalize_reset();
                     let addr_bytes = &hash[12..];
-
+                    
                     if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
                         // Found match! Reconstruct Private Key
                         let offset = local_steps + i as u64;
-                        let mut steps_bytes = [0u8; 32];
+                         let mut steps_bytes = [0u8; 32];
                         steps_bytes[24..].copy_from_slice(&offset.to_be_bytes());
                         
                         // Convert offset to Scalar
@@ -605,27 +636,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         
                         let wallet = SimpleWallet::new(matched_sk);
                         
-                        let addr_hex = hex_encode(&addr_bytes);
-                        let private_key_bytes = wallet.to_bytes();
+                    let addr_hex = hex_encode(&addr_bytes);
+                    let private_key_bytes = wallet.to_bytes();
 
-                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                        if idx < args_count {
-                            match save_encrypted_wallet(&wallet, &password, &output_dir) {
-                                Ok(path) => {
-                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
-                                    println!("Address:    0x{}", addr_hex);
-                                    if args_show_full_key {
-                                        println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                    } else {
+                    let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                    if idx < args_count {
+                        match save_encrypted_wallet(&wallet, &password, &output_dir) {
+                            Ok(path) => {
+                                println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
+                                println!("Address:    0x{}", addr_hex);
+                                if args_show_full_key {
+                                    println!("PrivateKey: {}", hex_encode(&private_key_bytes));
+                                } else {
                                         println!("PrivateKey: {}", redact_private_key(&hex_encode(&private_key_bytes)));
-                                    }
-                                    println!("Saved to:   {}", path);
-                                    println!("---");
-                                    sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
                                 }
-                                Err(e) => eprintln!("Error: {}", e),
+                                println!("Saved to:   {}", path);
+                                println!("---");
+                                    sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
                             }
-                        } else {
+                                Err(e) => eprintln!("Error: {}", e),
+                        }
+                    } else {
                             // Another thread finished
                             return; // Break outer loop
                         }
