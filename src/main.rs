@@ -135,7 +135,7 @@ struct Args {
     #[arg(long = "ask-password")]
     ask_password: bool,
 
-    #[arg(short = 'o', long = "output-dir", default_value = "/tmp/generated_wallets")]
+    #[arg(short = 'o', long = "output-dir")]
     output_dir: String,
 
     #[arg(short = 'n', long = "wallets", default_value = "1")]
@@ -351,6 +351,15 @@ fn format_metric(n: f64) -> String {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Set default output directory to ~/.cache/genwallet if not specified
+    let output_dir = if args.output_dir.is_empty() {
+        std::env::var("HOME")
+            .map(|home| format!("{}/.cache/genwallet", home))
+            .unwrap_or_else(|_| "/tmp/genwallet".to_string())
+    } else {
+        args.output_dir
+    };
     
     if args.count == 0 {
         return Err("Number of wallets must be greater than 0".into());
@@ -497,7 +506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let args_count = args.count;
         let args_show_mnemonic = args.show_mnemonic;
         let password = password.clone();
-        let output_dir = args.output_dir.clone();
+        let output_dir = output_dir.clone();
         let args_show_full_key = args.show_full_key;
         
         let handle = thread::spawn(move || {
@@ -692,7 +701,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Total attempts: {}M", total_attempts / 1_000_000);
     println!("Average rate: {:.0}K attempts/second", rate / 1_000.0);
     if args.count > 1 {
-        println!("All wallets saved to: {}", args.output_dir);
+        println!("All wallets saved to: {}", output_dir);
     }
     println!("\nTotal time: {:.2?}", elapsed);
 
