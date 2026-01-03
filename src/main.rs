@@ -136,7 +136,7 @@ struct Args {
     ask_password: bool,
 
     #[arg(short = 'o', long = "output-dir")]
-    output_dir: String,
+    output_dir: Option<String>,
 
     #[arg(short = 'n', long = "wallets", default_value = "1")]
     count: usize,
@@ -353,13 +353,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Set default output directory to ~/.cache/genwallet if not specified
-    let output_dir = if args.output_dir.is_empty() {
+    let output_dir = args.output_dir.unwrap_or_else(|| {
         std::env::var("HOME")
             .map(|home| format!("{}/.cache/genwallet", home))
             .unwrap_or_else(|_| "/tmp/genwallet".to_string())
-    } else {
-        args.output_dir
-    };
+    });
     
     if args.count == 0 {
         return Err("Number of wallets must be greater than 0".into());
