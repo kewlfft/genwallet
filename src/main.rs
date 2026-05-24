@@ -7,7 +7,7 @@ use k256::U256;
 use k256::elliptic_curve::bigint::Encoding; // Correct path
 
 use rand::rngs::StdRng; // Use StdRng (usually ChaCha12)
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use bip32::XPrv;
 use scrypt::{scrypt, Params as ScryptParams};
 use aes::Aes128;
@@ -179,7 +179,7 @@ fn save_encrypted_wallet(
     // Derive key using scrypt (same as ethers.js)
     let mut derived_key = [0u8; 32];
     // Use exact same parameters as ethers.js: n=262144, r=8, p=1
-    let scrypt_params = ScryptParams::new(18, 8, 1, 32).unwrap(); // log_n=18 means n=2^18=262144, len=32
+    let scrypt_params = ScryptParams::new(18, 8, 1).unwrap(); // log_n=18 means n=2^18=262144
     scrypt(password.as_bytes(), &salt, &scrypt_params, &mut derived_key).unwrap();
 
     // Encrypt private key using AES-128-CTR

@@ -1,26 +1,26 @@
 [package]
 name = "genwallet"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 
 [dependencies]
 # Core cryptography - using k256 for batch optimization
-k256 = { version = "0.13", features = ["arithmetic", "std"] }
+k256 = { version = "0.13.4", features = ["arithmetic", "std"] }
 bip39 = "2.2.2"
 bip32 = "0.5.3"
-scrypt = "0.11"
-aes = "0.8"
-ctr = "0.9"
+scrypt = "0.12"
+aes = "0.9"
+ctr = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Random number generation
-rand = { version = "0.9", features = ["std", "std_rng"] }
+rand = { version = "0.10", features = ["std", "std_rng"] }
 
 # Utilities
-clap = { version = "4.5.53", features = ["derive"] }
-rpassword = "7.4.0"
-sha3 = "0.10"
+clap = { version = "4.6", features = ["derive"] }
+rpassword = "7.5"
+sha3 = "0.12"
 
 [profile.release]
 opt-level = 3
