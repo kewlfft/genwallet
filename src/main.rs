@@ -259,6 +259,32 @@ fn match_prefix_suffix_bytes(
     true
 }
 
+fn format_metric(n: f64) -> String {
+    if n >= 1e9 {
+        format!("{:.2}G", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.2}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.2}k", n / 1e3)
+    } else {
+        format!("{:.0}", n)
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        "∞".into()
+    } else if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else if secs < 3600.0 {
+        format!("{:.0}m", secs / 60.0)
+    } else if secs < 86400.0 {
+        format!("{:.1}h", secs / 3600.0)
+    } else {
+        format!("{:.1}d", secs / 86400.0)
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -319,8 +345,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pb = ProgressBar::new(estimate);
     pb.set_style(
         ProgressStyle::with_template(
-            "[{elapsed_precise}] Attempts: {human_pos} | Found: {msg} | {per_sec} | ETA: {eta}",
+            "[{elapsed_precise}] Attempts: {pos} | Found: {msg} | {per_sec} | ETA: {eta}",
         )?
+        .with_key("pos", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+            write!(w, "{}", format_metric(state.pos() as f64)).unwrap()
+        })
+        .with_key("per_sec", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+            write!(w, "{}/s", format_metric(state.per_sec())).unwrap()
+        })
+        .with_key("eta", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+            write!(w, "{}", format_eta(state.eta().as_secs_f64())).unwrap()
+        })
         .progress_chars("##-"),
     );
     pb.set_message(format!("0/{}", args.count));
