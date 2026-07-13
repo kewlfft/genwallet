@@ -3,11 +3,16 @@ name = "genwallet"
 version = "0.6.6"
 edition = "2024"
 
+[features]
+default = []
+# BIP39/BIP32 mnemonic search (`--show-mnemonic`). Pulls bip32 → k256 0.13.
+mnemonic = ["dep:bip39", "dep:bip32"]
+
 [dependencies]
 # Core cryptography - using k256 for batch optimization
 k256 = { version = "0.14", features = ["arithmetic", "std"] }
-bip39 = "2.2.2"
-bip32 = "0.5.3"
+bip39 = { version = "2.2.2", optional = true }
+bip32 = { version = "0.5.3", optional = true }
 scrypt = "0.12"
 aes = "0.9"
 ctr = "0.10"
@@ -22,6 +27,10 @@ clap = { version = "4.6", features = ["derive"] }
 rpassword = "7.5"
 sha3 = "0.12"
 
+[[bench]]
+name = "hotpath_probe"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -31,3 +40,6 @@ strip = true
 overflow-checks = false
 debug = false
 incremental = false
+
+[profile.bench]
+inherits = "release"

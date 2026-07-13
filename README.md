@@ -8,12 +8,17 @@ Ethereum wallet generator with pattern matching.
 cargo build --release
 ```
 
+Mnemonic search (`--show-mnemonic`) is optional:
+
+```bash
+cargo build --release --features mnemonic
+```
+
 ## Usage
 
 ```bash
 ./target/release/genwallet --start abc --end def --count 1
 ```
-
 ## Security
 
 - Generated wallets are encrypted with passwords

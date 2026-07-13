@@ -1,9 +1,11 @@
+#[cfg(feature = "mnemonic")]
 use bip39::Mnemonic;
-use k256::{NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use k256::{AffinePoint, NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
 use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+#[cfg(feature = "mnemonic")]
 use bip32::XPrv;
 use scrypt::{scrypt, Params as ScryptParams};
 use aes::Aes128;
@@ -75,26 +77,26 @@ impl SimpleWallet {
         
         Self { private_key, address }
     }
-    
-    
+
+    #[cfg(feature = "mnemonic")]
     fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, Box<dyn std::error::Error>> {
         let seed = mnemonic.to_seed("");
         // Use BIP32 derivation: m/44'/60'/0'/0/0 (Ethereum standard)
         let mut xprv = XPrv::new(&seed)?;
-        
+
         // Derive each child number in the path manually
         // m/44'/60'/0'/0/0
         xprv = xprv.derive_child(bip32::ChildNumber::new(44, true)?)?; // 44'
         xprv = xprv.derive_child(bip32::ChildNumber::new(60, true)?)?; // 60'
-        xprv = xprv.derive_child(bip32::ChildNumber::new(0, true)?)?;  // 0'
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, true)?)?; // 0'
         xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
         xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
-        
+
         // bip32 XPrv returns bytes that need conversion to k256::SecretKey
         let private_key = SecretKey::from_slice(&xprv.to_bytes())?;
         Ok(Self::new(private_key))
     }
-    
+
     #[inline]
     fn address(&self) -> [u8; 20] {
         self.address
@@ -139,6 +141,8 @@ struct Args {
     #[arg(long = "threads")]
     threads: Option<usize>,
 
+    /// Search via BIP39 mnemonics (requires `--features mnemonic`)
+    #[cfg(feature = "mnemonic")]
     #[arg(long = "show-mnemonic")]
     show_mnemonic: bool,
 }
@@ -479,7 +483,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Create threads manually instead of using rayon
-    let g_point = ProjectivePoint::GENERATOR;
     let mut handles = Vec::with_capacity(thread_count);
     for seed in seeds {
         let sender = sender.clone();
@@ -488,6 +491,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let start_nybbles = start_nybbles.clone();
         let end_nybbles = end_nybbles.clone();
         let args_count = args.count;
+        #[cfg(feature = "mnemonic")]
         let args_show_mnemonic = args.show_mnemonic;
         let password = password.clone();
         let output_dir = output_dir.clone();
@@ -517,16 +521,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             const BATCH_SIZE: usize = 2048; // Stable peak amortization without cache thrashing
             const REPORT_BATCH_SIZE: u64 = 262_144; // Reduced contention (~250k steps)
 
-            // Pre-calculate increments: 1G, 2G, ... BATCH_SIZE*G as AffinePoints for mixed addition
-            // Adding Affine to Projective is faster than Projective + Projective
-            let mut increments = Vec::with_capacity(BATCH_SIZE);
-            let mut curr_g = g_point;
-            for _ in 0..BATCH_SIZE {
-                increments.push(curr_g.to_affine());
-                curr_g += g_point;
-            }
-            // Last element is BATCH_SIZE * G
-            let step_batch_g = ProjectivePoint::from(*increments.last().unwrap());
+            // Keep a single Affine G hot in cache — faster than a kG increment table
+            let g_affine = AffinePoint::GENERATOR;
 
             // Reused across batches to avoid re-zeroing large stack arrays every iteration
             let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
@@ -541,6 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                #[cfg(feature = "mnemonic")]
                 if args_show_mnemonic {
                     // Mnemonic path (slow, no batching needed)
                     let mut entropy = [0u8; 16];
@@ -574,10 +571,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Fast path: build P, P+G, ..., P+(BATCH_SIZE-1)G via mixed adds
-                batch_points[0] = current_point;
-                for i in 1..BATCH_SIZE {
-                    batch_points[i] = current_point + increments[i - 1];
+                // Fast path: P, P+G, P+2G, ... via repeated += G (keeps G in L1)
+                let mut p = current_point;
+                for slot in &mut batch_points {
+                    *slot = p;
+                    p += g_affine;
                 }
 
                 // Variable-time batch normalize — safe here (vanity search, not secret-dependent)
@@ -629,8 +627,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Advance base point by batch size for next batch
-                current_point += step_batch_g;
+                // p is already current + BATCH_SIZE*G
+                current_point = p;
                 local_steps += BATCH_SIZE as u64;
             }
         });
