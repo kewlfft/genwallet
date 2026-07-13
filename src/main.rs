@@ -14,7 +14,7 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use clap::Parser;
 use std::fs;
 use std::path::Path;
@@ -22,6 +22,7 @@ use rpassword::prompt_password;
 use std::sync::mpsc;
 use std::thread;
 use sha3::{Keccak256, Digest};
+use indicatif::{ProgressBar, ProgressStyle};
 
 struct SimpleWallet {
     private_key: SecretKey,
@@ -109,7 +110,7 @@ fn save_encrypted_wallet(
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    let addr = hex_encode(&wallet.address);
+    let addr = hex::encode(wallet.address);
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
     let private_key_bytes = wallet.to_bytes();
 
@@ -147,18 +148,18 @@ fn save_encrypted_wallet(
         "id": id,
         "address": format!("0x{addr}"),
         "crypto": {
-            "ciphertext": hex_encode(&ciphertext),
-            "cipherparams": { "iv": hex_encode(&iv) },
+            "ciphertext": hex::encode(ciphertext),
+            "cipherparams": { "iv": hex::encode(iv) },
             "cipher": "aes-128-ctr",
             "kdf": "scrypt",
             "kdfparams": {
                 "dklen": 32,
-                "salt": hex_encode(&salt),
+                "salt": hex::encode(salt),
                 "n": 262144,
                 "r": 8,
                 "p": 1,
             },
-            "mac": hex_encode(&mac),
+            "mac": hex::encode(mac),
         },
     });
 
@@ -167,6 +168,7 @@ fn save_encrypted_wallet(
 }
 
 fn report_found(
+    pb: &ProgressBar,
     idx: usize,
     count: usize,
     addr_hex: &str,
@@ -175,20 +177,23 @@ fn report_found(
     show_full_key: bool,
     #[cfg(feature = "mnemonic")] mnemonic: Option<&str>,
 ) {
-    println!("\n🎉 Found wallet {} of {}", idx + 1, count);
-    println!("Address:    0x{}", addr_hex);
-    let pk = hex_encode(private_key_bytes);
-    if show_full_key {
-        println!("PrivateKey: {}", pk);
-    } else {
-        println!("PrivateKey: {}", redact_private_key(&pk));
-    }
-    #[cfg(feature = "mnemonic")]
-    if let Some(m) = mnemonic {
-        println!("Mnemonic:   {}", m);
-    }
-    println!("Saved to:   {}", path);
-    println!("---");
+    // suspend so messages print even when the bar draw target is hidden (non-TTY)
+    pb.suspend(|| {
+        println!("\n🎉 Found wallet {} of {}", idx + 1, count);
+        println!("Address:    0x{}", addr_hex);
+        let pk = hex::encode(private_key_bytes);
+        if show_full_key {
+            println!("PrivateKey: {}", pk);
+        } else {
+            println!("PrivateKey: {}", redact_private_key(&pk));
+        }
+        #[cfg(feature = "mnemonic")]
+        if let Some(m) = mnemonic {
+            println!("Mnemonic:   {}", m);
+        }
+        println!("Saved to:   {}", path);
+        println!("---");
+    });
 }
 
 fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
@@ -201,17 +206,6 @@ fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
             _ => 0,
         })
         .collect()
-}
-
-fn hex_encode(data: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut hex_bytes = Vec::with_capacity(data.len() * 2);
-    for &byte in data {
-        hex_bytes.push(HEX[(byte >> 4) as usize]);
-        hex_bytes.push(HEX[(byte & 0x0F) as usize]);
-    }
-    // SAFETY: HEX digits are always valid ASCII
-    unsafe { String::from_utf8_unchecked(hex_bytes) }
 }
 
 fn generate_random_password(len: usize) -> String {
@@ -265,25 +259,13 @@ fn match_prefix_suffix_bytes(
     true
 }
 
-fn format_metric(n: f64) -> String {
-    if n >= 1e9 {
-        format!("{:.2}G", n / 1e9)
-    } else if n >= 1e6 {
-        format!("{:.2}M", n / 1e6)
-    } else if n >= 1e3 {
-        format!("{:.2}k", n / 1e3)
-    } else {
-        format!("{:.0}", n)
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let output_dir = args.output_dir.unwrap_or_else(|| {
-        std::env::var("HOME")
-            .map(|home| format!("{}/.cache/genwallet", home))
-            .unwrap_or_else(|_| "/tmp/genwallet".to_string())
+        dirs::cache_dir()
+            .map(|p| p.join("genwallet").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/tmp/genwallet".to_string())
     });
 
     if args.count == 0 {
@@ -333,17 +315,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
 
+    let estimate = (pattern_difficulty * args.count as f64).ceil().max(1.0) as u64;
+    let pb = ProgressBar::new(estimate);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] Attempts: {human_pos} | Found: {msg} | {per_sec} | ETA: {eta}",
+        )?
+        .progress_chars("##-"),
+    );
+    pb.set_message(format!("0/{}", args.count));
+
     let monitor_found = found_count.clone();
     let monitor_attempts = total_attempts.clone();
     let monitor_args_count = args.count;
     let monitor_difficulty = pattern_difficulty;
+    let monitor_pb = pb.clone();
 
     thread::spawn(move || {
-        let mut last_attempts = 0u64;
-        let mut last_time = Instant::now();
-
         loop {
-            thread::sleep(std::time::Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
 
             let current_found = monitor_found.load(Ordering::Relaxed);
             if current_found >= monitor_args_count {
@@ -351,49 +341,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let current_attempts = monitor_attempts.load(Ordering::Relaxed);
-            let total_elapsed = start_time.elapsed();
-            let step_elapsed = last_time.elapsed();
-
-            let delta_attempts = current_attempts.saturating_sub(last_attempts);
-            let instant_rate = delta_attempts as f64 / step_elapsed.as_secs_f64();
-            let avg_rate = current_attempts as f64 / total_elapsed.as_secs_f64();
-
-            let remaining_wallets = monitor_args_count.saturating_sub(current_found);
-            let eta_seconds = if instant_rate > 0.0 && remaining_wallets > 0 {
-                let attempts_per_wallet = if current_found > 0 {
-                    current_attempts as f64 / current_found as f64
-                } else {
-                    monitor_difficulty
-                };
-                (attempts_per_wallet * remaining_wallets as f64) / instant_rate
+            let attempts_per_wallet = if current_found > 0 {
+                current_attempts as f64 / current_found as f64
             } else {
-                0.0
+                monitor_difficulty
             };
+            let remaining = monitor_args_count.saturating_sub(current_found);
+            let target = current_attempts
+                .saturating_add((attempts_per_wallet * remaining as f64) as u64)
+                .max(current_attempts.saturating_add(1));
 
-            let eta_str = if eta_seconds > 0.0 {
-                if eta_seconds < 60.0 {
-                    format!("{:.0}s", eta_seconds)
-                } else if eta_seconds < 3600.0 {
-                    format!("{:.0}m", eta_seconds / 60.0)
-                } else {
-                    format!("{:.1}h", eta_seconds / 3600.0)
-                }
-            } else {
-                "∞".to_string()
-            };
-
-            print!(
-                "\r[Progress] Attempts: {} | Found: {}/{} | Speed: {}/s (Avg: {}/s) | ETA: {}   ",
-                format_metric(current_attempts as f64),
-                current_found,
-                monitor_args_count,
-                format_metric(instant_rate),
-                format_metric(avg_rate),
-                eta_str
-            );
-
-            last_attempts = current_attempts;
-            last_time = Instant::now();
+            monitor_pb.set_length(target);
+            monitor_pb.set_position(current_attempts);
+            monitor_pb.set_message(format!("{}/{}", current_found, monitor_args_count));
         }
     });
 
@@ -414,6 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = password.clone();
         let output_dir = output_dir.clone();
         let args_show_full_key = args.show_full_key;
+        let pb = pb.clone();
 
         handles.push(thread::spawn(move || {
             let mut rng = StdRng::from_seed(seed);
@@ -455,13 +416,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &end_nybbles,
                                 fast_fail_byte,
                             ) {
-                                let addr_hex = hex_encode(&addr_bytes);
+                                let addr_hex = hex::encode(addr_bytes);
                                 let private_key_bytes = wallet.to_bytes();
                                 let idx = found_count.fetch_add(1, Ordering::AcqRel);
                                 if idx < args_count {
                                     match save_encrypted_wallet(&wallet, &password, &output_dir) {
                                         Ok(path) => {
                                             report_found(
+                                                &pb,
                                                 idx,
                                                 args_count,
                                                 &addr_hex,
@@ -472,7 +434,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             );
                                             sender.send(()).ok();
                                         }
-                                        Err(e) => eprintln!("Error: {}", e),
+                                        Err(e) => {
+                                            pb.suspend(|| eprintln!("Error: {}", e));
+                                        }
                                     }
                                 } else {
                                     break;
@@ -513,13 +477,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         let wallet = SimpleWallet::new(matched_sk);
 
-                        let addr_hex = hex_encode(addr_bytes);
+                        let addr_hex = hex::encode(addr_bytes);
                         let private_key_bytes = wallet.to_bytes();
                         let idx = found_count.fetch_add(1, Ordering::AcqRel);
                         if idx < args_count {
                             match save_encrypted_wallet(&wallet, &password, &output_dir) {
                                 Ok(path) => {
                                     report_found(
+                                        &pb,
                                         idx,
                                         args_count,
                                         &addr_hex,
@@ -531,7 +496,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     sender.send(()).ok();
                                 }
-                                Err(e) => eprintln!("Error: {}", e),
+                                Err(e) => {
+                                    pb.suspend(|| eprintln!("Error: {}", e));
+                                }
                             }
                         } else {
                             return;
@@ -554,6 +521,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while receiver.recv().is_ok() {
         found += 1;
     }
+
+    pb.finish_and_clear();
 
     let elapsed = start_time.elapsed();
     let total_attempts = total_attempts.load(Ordering::Relaxed);
