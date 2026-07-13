@@ -138,7 +138,7 @@ struct Args {
     #[arg(short = 'n', long = "wallets", default_value = "1")]
     count: usize,
 
-    #[arg(long = "threads")]
+    #[arg(short = 't', long = "threads")]
     threads: Option<usize>,
 
     /// Search via BIP39 mnemonics (requires `--features mnemonic`)
