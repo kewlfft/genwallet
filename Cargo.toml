@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # Core cryptography - using k256 for batch optimization
-k256 = { version = "0.13.4", features = ["arithmetic", "std"] }
+k256 = { version = "0.14", features = ["arithmetic", "std"] }
 bip39 = "2.2.2"
 bip32 = "0.5.3"
 scrypt = "0.12"
@@ -22,6 +22,14 @@ clap = { version = "4.6", features = ["derive"] }
 rpassword = "7.5"
 sha3 = "0.12"
 
+[dev-dependencies]
+# Previous library version for A/B hot-path comparison (`benches/hotpath_compare.rs`)
+k256_v013 = { package = "k256", version = "0.13.4", features = ["arithmetic", "std"] }
+
+[[bench]]
+name = "hotpath_compare"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -31,4 +39,7 @@ strip = true
 overflow-checks = false
 debug = false
 incremental = false
- 
+
+# Match release opts so `cargo bench` numbers are meaningful
+[profile.bench]
+inherits = "release"

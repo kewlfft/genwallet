@@ -1,12 +1,8 @@
 use bip39::Mnemonic;
-use k256::{SecretKey, Scalar, ProjectivePoint};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::elliptic_curve::ops::Reduce;
-use k256::elliptic_curve::BatchNormalize;
-use k256::U256; 
-use k256::elliptic_curve::bigint::Encoding; // Correct path
+use k256::{NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
 
-use rand::rngs::StdRng; // Use StdRng (usually ChaCha12)
+use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use bip32::XPrv;
 use scrypt::{scrypt, Params as ScryptParams};
@@ -68,11 +64,10 @@ impl SimpleWallet {
     #[inline]
     fn new(private_key: SecretKey) -> Self {
         let public_key = private_key.public_key();
-        let pub_point = public_key.to_encoded_point(false);
-        let pub_bytes = pub_point.as_bytes();
-
+        let point = public_key.as_affine();
         let mut hasher = Keccak256::new();
-        hasher.update(&pub_bytes[1..]);
+        hasher.update(point.x());
+        hasher.update(point.y());
         let hash = hasher.finalize();
 
         let mut address = [0u8; 20];
@@ -149,13 +144,7 @@ struct Args {
 }
 
 fn redact_private_key(private_key: &str) -> String {
-    if private_key.len() <= 12 {
-        "*".repeat(private_key.len())
-    } else {
-    let prefix = &private_key[..6];
-    let suffix = &private_key[private_key.len() - 6..];
-    format!("{}...{}", prefix, suffix)
-    }
+    format!("{}...{}", &private_key[..4], &private_key[private_key.len() - 4..])
 }
 
 fn save_encrypted_wallet(
@@ -255,20 +244,13 @@ fn create_hardware_rng() -> StdRng {
 
 #[inline]
 fn hex_encode(data: &[u8]) -> String {
-    // Use exact capacity for common sizes to avoid reallocations
-    let capacity = match data.len() {
-        16 => 32,  // IV
-        20 => 40,  // Address
-        32 => 64,  // Private key, salt, derived key, MAC
-        64 => 128, // SHA3-256 hash
-        _ => data.len() * 2, // Fallback for other sizes
-    };
-    // Use unsafe construction for better performance - hex digits are always valid ASCII
-    let mut hex_bytes = Vec::with_capacity(capacity);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex_bytes = Vec::with_capacity(data.len() * 2);
     for &byte in data {
-        hex_bytes.push(b"0123456789abcdef"[(byte >> 4) as usize]);
-        hex_bytes.push(b"0123456789abcdef"[(byte & 0x0F) as usize]);
+        hex_bytes.push(HEX[(byte >> 4) as usize]);
+        hex_bytes.push(HEX[(byte & 0x0F) as usize]);
     }
+    // SAFETY: HEX digits are always valid ASCII
     unsafe { String::from_utf8_unchecked(hex_bytes) }
 }
 
@@ -425,6 +407,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    // Shared immutable pattern data (avoid per-thread Vec clones)
+    let start_nybbles = std::sync::Arc::<[u8]>::from(start_nybbles);
+    let end_nybbles = std::sync::Arc::<[u8]>::from(end_nybbles);
+
     // Monitor thread for progress reporting
     let monitor_found = found_count.clone();
     let monitor_attempts = total_attempts.clone();
@@ -531,17 +517,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             const BATCH_SIZE: usize = 2048; // Stable peak amortization without cache thrashing
             const REPORT_BATCH_SIZE: u64 = 262_144; // Reduced contention (~250k steps)
 
-            // Pre-calculate increments: 1G, 2G, ... 32G as AffinePoints for mixed addition
+            // Pre-calculate increments: 1G, 2G, ... BATCH_SIZE*G as AffinePoints for mixed addition
             // Adding Affine to Projective is faster than Projective + Projective
             let mut increments = Vec::with_capacity(BATCH_SIZE);
             let mut curr_g = g_point;
             for _ in 0..BATCH_SIZE {
-                increments.push(curr_g.to_affine()); // Store as Affine
+                increments.push(curr_g.to_affine());
                 curr_g += g_point;
             }
-            // curr_g is now (BATCH_SIZE + 1)G, but we want step_batch_g = BATCH_SIZE * G
-            // The last element in increments is exactly BATCH_SIZE * G
+            // Last element is BATCH_SIZE * G
             let step_batch_g = ProjectivePoint::from(*increments.last().unwrap());
+
+            // Reused across batches to avoid re-zeroing large stack arrays every iteration
+            let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
 
             loop {
                 // Batch reporting and check
@@ -561,8 +549,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(wallet) = SimpleWallet::from_mnemonic(&mnemonic) {
                             let addr_bytes = wallet.address();
                             if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
-                                // Found via mnemonic!
-                                // ... handle success ...
                                 let addr_hex = hex_encode(&addr_bytes);
                                 let private_key_bytes = wallet.to_bytes();
 
@@ -573,13 +559,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
                                             println!("Address:    0x{}", addr_hex);
                                             println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                            println!("Mnemonic:   {}", mnemonic.to_string());
+                                            println!("Mnemonic:   {}", mnemonic);
                                             println!("Saved to:   {}", path);
                                             println!("---");
                                             sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
                                         }
                                         Err(e) => eprintln!("Error: {}", e),
-                            }
+                                    }
                                 } else { break; }
                             }
                         }
@@ -588,84 +574,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Fast Path: Batch Optimization
-                
-                // 1. Generate batch of 8 points: P, P+G, ..., P+7G
-                // We actually want P+0, P+1, ... P+7
-                // But current_point is P.
-                // We add our pre-calc increments.
-                let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
-                // Manually unroll or loop? Loop is fine, compiler unrolls.
-                for i in 0..BATCH_SIZE {
-                    // This is (Base + i*G) - we precalculated i*G (1-based), 
-                    // so we need 0-based.
-                    // P_0 = current_point
-                    // P_i = current_point + increments[i-1] (where increments are Affine)
-                    if i == 0 {
-                        batch_points[0] = current_point;
-                } else {
-                        batch_points[i] = current_point + increments[i-1];
-                    }
+                // Fast path: build P, P+G, ..., P+(BATCH_SIZE-1)G via mixed adds
+                batch_points[0] = current_point;
+                for i in 1..BATCH_SIZE {
+                    batch_points[i] = current_point + increments[i - 1];
                 }
 
-                // 2. Batch Normalize (THE KEY SPEEDUP)
-                // Converts all 8 Projective points to Affine points with 1 inversion
-                let affine_points = ProjectivePoint::batch_normalize(&batch_points);
+                // Variable-time batch normalize — safe here (vanity search, not secret-dependent)
+                let affine_points =
+                    <ProjectivePoint as BatchNormalize<_>>::batch_normalize_vartime(&batch_points);
 
-                // 3. Process batch
                 for (i, point) in affine_points.iter().enumerate() {
-                    // Access coordinates via ToEncodedPoint (robust)
-                    let encoded = point.to_encoded_point(false);
-                    let x = encoded.x().unwrap();
-                    let y = encoded.y().unwrap();
+                    // Direct field-byte coords — skips SEC1 ToEncodedPoint overhead
+                    let x = point.x();
+                    let y = point.y();
 
-                    // Keccak-256 hash of (X || Y)
                     hasher.update(x);
                     hasher.update(y);
                     let hash = hasher.finalize_reset();
                     let addr_bytes = &hash[12..];
                     
                     if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
-                        // Found match! Reconstruct Private Key
+                        // Reconstruct private key: sk + offset (offset fits in u64)
                         let offset = local_steps + i as u64;
-                         let mut steps_bytes = [0u8; 32];
-                        steps_bytes[24..].copy_from_slice(&offset.to_be_bytes());
-                        
-                        // Convert offset to Scalar
-                        let offset_uint = U256::from_be_bytes(steps_bytes);
-                        // Use reduce to ensure it fits in field
-                        let scalar = <Scalar as Reduce<U256>>::reduce(offset_uint);
-                        
-                        // Add scalar to secret key: sk_new = sk + offset
-                        let sk_scalar = initial_sk.to_nonzero_scalar();
-                        let matched_scalar = sk_scalar.as_ref() + scalar;
-                        let matched_sk = SecretKey::new(matched_scalar.into());
-                        
+                        let matched_scalar = initial_sk.to_nonzero_scalar().as_ref() + Scalar::from(offset);
+                        let matched_sk = SecretKey::from(
+                            NonZeroScalar::new(matched_scalar).expect("matched scalar nonzero"),
+                        );
                         let wallet = SimpleWallet::new(matched_sk);
                         
-                    let addr_hex = hex_encode(&addr_bytes);
-                    let private_key_bytes = wallet.to_bytes();
+                        let addr_hex = hex_encode(addr_bytes);
+                        let private_key_bytes = wallet.to_bytes();
 
-                    let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                    if idx < args_count {
-                        match save_encrypted_wallet(&wallet, &password, &output_dir) {
-                            Ok(path) => {
-                                println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
-                                println!("Address:    0x{}", addr_hex);
-                                if args_show_full_key {
-                                    println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                } else {
+                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
+                        if idx < args_count {
+                            match save_encrypted_wallet(&wallet, &password, &output_dir) {
+                                Ok(path) => {
+                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
+                                    println!("Address:    0x{}", addr_hex);
+                                    if args_show_full_key {
+                                        println!("PrivateKey: {}", hex_encode(&private_key_bytes));
+                                    } else {
                                         println!("PrivateKey: {}", redact_private_key(&hex_encode(&private_key_bytes)));
-                                }
-                                println!("Saved to:   {}", path);
-                                println!("---");
+                                    }
+                                    println!("Saved to:   {}", path);
+                                    println!("---");
                                     sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
-                            }
+                                }
                                 Err(e) => eprintln!("Error: {}", e),
-                        }
-                    } else {
-                            // Another thread finished
-                            return; // Break outer loop
+                            }
+                        } else {
+                            return;
                         }
                     }
                 }
