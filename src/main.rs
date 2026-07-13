@@ -11,39 +11,6 @@ use scrypt::{scrypt, Params as ScryptParams};
 use aes::Aes128;
 use ctr::Ctr32BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
-use serde::{Serialize, Deserialize};
-
-#[derive(Serialize, Deserialize)]
-struct Keystore {
-    version: u32,
-    id: String,
-    address: String,
-    crypto: Crypto,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Crypto {
-    ciphertext: String,
-    cipherparams: CipherParams,
-    cipher: String,
-    kdf: String,
-    kdfparams: KdfParams,
-    mac: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CipherParams {
-    iv: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct KdfParams {
-    dklen: u32,
-    salt: String,
-    n: u32,
-    r: u32,
-    p: u32,
-}
 
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,14 +23,12 @@ use std::sync::mpsc;
 use std::thread;
 use sha3::{Keccak256, Digest};
 
-// Simple wallet struct using k256
 struct SimpleWallet {
     private_key: SecretKey,
     address: [u8; 20],
 }
 
 impl SimpleWallet {
-    #[inline]
     fn new(private_key: SecretKey) -> Self {
         let public_key = private_key.public_key();
         let point = public_key.as_affine();
@@ -74,40 +39,26 @@ impl SimpleWallet {
 
         let mut address = [0u8; 20];
         address.copy_from_slice(&hash[12..]);
-        
         Self { private_key, address }
     }
 
     #[cfg(feature = "mnemonic")]
     fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, Box<dyn std::error::Error>> {
         let seed = mnemonic.to_seed("");
-        // Use BIP32 derivation: m/44'/60'/0'/0/0 (Ethereum standard)
         let mut xprv = XPrv::new(&seed)?;
-
-        // Derive each child number in the path manually
         // m/44'/60'/0'/0/0
-        xprv = xprv.derive_child(bip32::ChildNumber::new(44, true)?)?; // 44'
-        xprv = xprv.derive_child(bip32::ChildNumber::new(60, true)?)?; // 60'
-        xprv = xprv.derive_child(bip32::ChildNumber::new(0, true)?)?; // 0'
-        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
-        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?; // 0
-
-        // bip32 XPrv returns bytes that need conversion to k256::SecretKey
-        let private_key = SecretKey::from_slice(&xprv.to_bytes())?;
-        Ok(Self::new(private_key))
+        xprv = xprv.derive_child(bip32::ChildNumber::new(44, true)?)?;
+        xprv = xprv.derive_child(bip32::ChildNumber::new(60, true)?)?;
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, true)?)?;
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?;
+        xprv = xprv.derive_child(bip32::ChildNumber::new(0, false)?)?;
+        Ok(Self::new(SecretKey::from_slice(&xprv.to_bytes())?))
     }
 
-    #[inline]
-    fn address(&self) -> [u8; 20] {
-        self.address
-    }
-    
-    #[inline]
     fn to_bytes(&self) -> [u8; 32] {
         self.private_key.to_bytes().into()
     }
 }
-
 
 #[derive(Parser, Debug)]
 #[command(
@@ -158,95 +109,100 @@ fn save_encrypted_wallet(
 ) -> Result<String, Box<dyn std::error::Error>> {
     fs::create_dir_all(output_dir)?;
 
-    let addr = hex_encode(&wallet.address());
+    let addr = hex_encode(&wallet.address);
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
     let private_key_bytes = wallet.to_bytes();
 
-    // Generate random salt and IV
-    let mut rng = create_hardware_rng();
+    let mut rng = rand::rng();
     let mut salt = [0u8; 32];
     let mut iv = [0u8; 16];
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut iv);
 
-    // Derive key using scrypt (same as ethers.js)
+    // ethers.js-compatible scrypt: n=2^18=262144, r=8, p=1
     let mut derived_key = [0u8; 32];
-    // Use exact same parameters as ethers.js: n=262144, r=8, p=1
-    let scrypt_params = ScryptParams::new(18, 8, 1).unwrap(); // log_n=18 means n=2^18=262144
+    let scrypt_params = ScryptParams::new(18, 8, 1).unwrap();
     scrypt(password.as_bytes(), &salt, &scrypt_params, &mut derived_key).unwrap();
 
-    // Encrypt private key using AES-128-CTR
     let mut cipher = Ctr32BE::<Aes128>::new_from_slices(&derived_key[..16], &iv).unwrap();
     let mut ciphertext = private_key_bytes;
     cipher.apply_keystream(&mut ciphertext);
 
-    // Calculate MAC (SHA3-256 of derived_key[16..32] + ciphertext)
-    // Use chain() instead of concat() to avoid allocation
     let mut mac_hasher = Keccak256::new();
     mac_hasher.update(&derived_key[16..32]);
     mac_hasher.update(&ciphertext);
     let mac = mac_hasher.finalize();
 
-    // Generate unique ID: timestamp + random
-    let id = format!("{:x}-{:x}", 
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+    let id = format!(
+        "{:x}-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
         rng.next_u64()
     );
 
-    // Create keystore structure
-    let keystore = Keystore {
-        version: 3,
-        id,
-        address: format!("0x{}", addr),
-        crypto: Crypto {
-            ciphertext: hex_encode(&ciphertext),
-            cipherparams: CipherParams {
-                iv: hex_encode(&iv),
+    let keystore = serde_json::json!({
+        "version": 3,
+        "id": id,
+        "address": format!("0x{addr}"),
+        "crypto": {
+            "ciphertext": hex_encode(&ciphertext),
+            "cipherparams": { "iv": hex_encode(&iv) },
+            "cipher": "aes-128-ctr",
+            "kdf": "scrypt",
+            "kdfparams": {
+                "dklen": 32,
+                "salt": hex_encode(&salt),
+                "n": 262144,
+                "r": 8,
+                "p": 1,
             },
-            cipher: "aes-128-ctr".to_string(),
-            kdf: "scrypt".to_string(),
-            kdfparams: KdfParams {
-                dklen: 32,
-                salt: hex_encode(&salt),
-                n: 262144,
-                r: 8,
-                p: 1,
-            },
-            mac: hex_encode(&mac),
+            "mac": hex_encode(&mac),
         },
-    };
+    });
 
-    // Save as JSON
     fs::write(&file_path, serde_json::to_string_pretty(&keystore)?)?;
-
     Ok(file_path.display().to_string())
 }
 
-#[inline]
+fn report_found(
+    idx: usize,
+    count: usize,
+    addr_hex: &str,
+    private_key_bytes: &[u8; 32],
+    path: &str,
+    show_full_key: bool,
+    #[cfg(feature = "mnemonic")] mnemonic: Option<&str>,
+) {
+    println!("\n🎉 Found wallet {} of {}", idx + 1, count);
+    println!("Address:    0x{}", addr_hex);
+    let pk = hex_encode(private_key_bytes);
+    if show_full_key {
+        println!("PrivateKey: {}", pk);
+    } else {
+        println!("PrivateKey: {}", redact_private_key(&pk));
+    }
+    #[cfg(feature = "mnemonic")]
+    if let Some(m) = mnemonic {
+        println!("Mnemonic:   {}", m);
+    }
+    println!("Saved to:   {}", path);
+    println!("---");
+}
+
 fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
-    // Pre-allocate with exact capacity to avoid reallocations
-    // Use bytes iterator for better performance (ASCII only)
-    let mut nybbles = Vec::with_capacity(hex_str.len());
-    for &byte in hex_str.as_bytes() {
-        let nybble = match byte {
+    hex_str
+        .bytes()
+        .map(|byte| match byte {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
             b'A'..=b'F' => byte - b'A' + 10,
             _ => 0,
-        };
-        nybbles.push(nybble);
-    }
-    nybbles
+        })
+        .collect()
 }
 
-fn create_hardware_rng() -> StdRng {
-    let mut seed = [0u8; 32];
-    // Use rand::rng() which is cryptographically secure and seeded from OS
-    rand::rng().fill_bytes(&mut seed);
-    StdRng::from_seed(seed)
-}
-
-#[inline]
 fn hex_encode(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hex_bytes = Vec::with_capacity(data.len() * 2);
@@ -259,32 +215,23 @@ fn hex_encode(data: &[u8]) -> String {
 }
 
 fn generate_random_password(len: usize) -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                             abcdefghijklmnopqrstuvwxyz\
-                             0123456789";
-    let mut rng = create_hardware_rng();
-
-    // Use unsafe String construction for better performance
-    // CHARSET only contains ASCII, so this is safe
-    let mut password = Vec::with_capacity(len);
-    password.resize(len, 0);
-    for byte in &mut password {
-        let idx = (rng.next_u32() as usize) % CHARSET.len();
-        *byte = CHARSET[idx];
-    }
-
+    const CHARSET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    let password: Vec<u8> = (0..len)
+        .map(|_| CHARSET[(rng.next_u32() as usize) % CHARSET.len()])
+        .collect();
+    // SAFETY: CHARSET is ASCII
     unsafe { String::from_utf8_unchecked(password) }
 }
 
 #[inline(always)]
 fn match_prefix_suffix_bytes(
-    addr: &[u8], 
-    start_hex: &[u8], 
+    addr: &[u8],
+    start_hex: &[u8],
     end_hex: &[u8],
-    fast_fail: Option<u8>
+    fast_fail: Option<u8>,
 ) -> bool {
-    // Fast fail optimization: Check first byte directly
-    // This avoids loop setup and bitwise ops for 99.6% of non-matches
     if let Some(expected) = fast_fail {
         if addr[0] != expected {
             return false;
@@ -293,26 +240,21 @@ fn match_prefix_suffix_bytes(
 
     #[inline(always)]
     fn nybble(addr: &[u8], i: usize) -> u8 {
-        if i % 2 == 0 { 
-            addr[i / 2] >> 4 
-        } else { 
-            addr[i / 2] & 0x0F 
+        if i % 2 == 0 {
+            addr[i / 2] >> 4
+        } else {
+            addr[i / 2] & 0x0F
         }
     }
 
-    // Check prefix
     for (i, &expected) in start_hex.iter().enumerate() {
         if nybble(addr, i) != expected {
             return false;
         }
     }
 
-    // Check suffix
-    let suffix_len = end_hex.len();
-    if suffix_len > 0 {
-        let total_nybbles = 40;
-        let suffix_start = total_nybbles - suffix_len;
-
+    if !end_hex.is_empty() {
+        let suffix_start = 40 - end_hex.len();
         for (i, &expected) in end_hex.iter().enumerate() {
             if nybble(addr, suffix_start + i) != expected {
                 return false;
@@ -338,42 +280,32 @@ fn format_metric(n: f64) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Set default output directory to ~/.cache/genwallet if not specified
     let output_dir = args.output_dir.unwrap_or_else(|| {
         std::env::var("HOME")
             .map(|home| format!("{}/.cache/genwallet", home))
             .unwrap_or_else(|_| "/tmp/genwallet".to_string())
     });
-    
+
     if args.count == 0 {
         return Err("Number of wallets must be greater than 0".into());
     }
     if args.start_pattern.len() > 40 || args.end_pattern.len() > 40 {
         return Err("Pattern length cannot exceed 40 characters".into());
     }
-    
-    // Convert to lowercase once and reuse
+
     let pattern_start = args.start_pattern.to_lowercase();
     let pattern_end = args.end_pattern.to_lowercase();
-    let start_nybbles = hex_to_nybbles(&pattern_start);
-    let end_nybbles = hex_to_nybbles(&pattern_end);
-    
-    // Pre-calculate fast fail byte (first 2 nybbles)
+    let start_nybbles = Arc::<[u8]>::from(hex_to_nybbles(&pattern_start));
+    let end_nybbles = Arc::<[u8]>::from(hex_to_nybbles(&pattern_end));
+
     let fast_fail_byte = if start_nybbles.len() >= 2 {
         Some((start_nybbles[0] << 4) | start_nybbles[1])
     } else {
         None
     };
 
-    let pattern_difficulty = if !pattern_start.is_empty() && !pattern_end.is_empty() {
-        16.0_f64.powi((pattern_start.len() + pattern_end.len()) as i32)
-    } else if !pattern_start.is_empty() {
-        16.0_f64.powi(pattern_start.len() as i32)
-    } else if !pattern_end.is_empty() {
-        16.0_f64.powi(pattern_end.len() as i32)
-    } else {
-        1.0
-    };
+    let pattern_difficulty =
+        16.0_f64.powi((pattern_start.len() + pattern_end.len()) as i32);
 
     let thread_count = args.threads.unwrap_or_else(|| {
         thread::available_parallelism()
@@ -401,48 +333,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
 
-    // Create seeds once using hardware entropy
-    let mut master_rng = create_hardware_rng();
-    let seeds: Vec<[u8; 32]> = (0..thread_count)
-        .map(|_| {
-            let mut seed = [0u8; 32];
-            master_rng.fill_bytes(&mut seed);
-            seed
-        })
-        .collect();
-
-    // Shared immutable pattern data (avoid per-thread Vec clones)
-    let start_nybbles = std::sync::Arc::<[u8]>::from(start_nybbles);
-    let end_nybbles = std::sync::Arc::<[u8]>::from(end_nybbles);
-
-    // Monitor thread for progress reporting
     let monitor_found = found_count.clone();
     let monitor_attempts = total_attempts.clone();
-    let monitor_start = Instant::now();
     let monitor_args_count = args.count;
     let monitor_difficulty = pattern_difficulty;
-    
+
     thread::spawn(move || {
-        let mut last_attempts = 0;
+        let mut last_attempts = 0u64;
         let mut last_time = Instant::now();
-        
+
         loop {
             thread::sleep(std::time::Duration::from_secs(1));
-            
+
             let current_found = monitor_found.load(Ordering::Relaxed);
             if current_found >= monitor_args_count {
                 break;
             }
-            
+
             let current_attempts = monitor_attempts.load(Ordering::Relaxed);
-            let total_elapsed = monitor_start.elapsed();
+            let total_elapsed = start_time.elapsed();
             let step_elapsed = last_time.elapsed();
-            
+
             let delta_attempts = current_attempts.saturating_sub(last_attempts);
             let instant_rate = delta_attempts as f64 / step_elapsed.as_secs_f64();
             let avg_rate = current_attempts as f64 / total_elapsed.as_secs_f64();
-            
-            // ETA logic based on INSTANT rate
+
             let remaining_wallets = monitor_args_count.saturating_sub(current_found);
             let eta_seconds = if instant_rate > 0.0 && remaining_wallets > 0 {
                 let attempts_per_wallet = if current_found > 0 {
@@ -476,15 +391,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format_metric(avg_rate),
                 eta_str
             );
-            
+
             last_attempts = current_attempts;
             last_time = Instant::now();
         }
     });
 
-    // Create threads manually instead of using rayon
+    let mut master_rng = rand::rng();
     let mut handles = Vec::with_capacity(thread_count);
-    for seed in seeds {
+    for _ in 0..thread_count {
+        let mut seed = [0u8; 32];
+        master_rng.fill_bytes(&mut seed);
+
         let sender = sender.clone();
         let total_attempts = total_attempts.clone();
         let found_count = found_count.clone();
@@ -496,42 +414,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let password = password.clone();
         let output_dir = output_dir.clone();
         let args_show_full_key = args.show_full_key;
-        
-        let handle = thread::spawn(move || {
+
+        handles.push(thread::spawn(move || {
             let mut rng = StdRng::from_seed(seed);
 
-            // Initialize starting point
             let mut private_key_bytes = [0u8; 32];
             rng.fill_bytes(&mut private_key_bytes);
-            
-            // Ensure valid scalar
-            let current_sk = SecretKey::from_slice(&private_key_bytes).unwrap_or_else(|_| {
-                 SecretKey::from_slice(&[1u8; 32]).unwrap()
+
+            let initial_sk = SecretKey::from_slice(&private_key_bytes).unwrap_or_else(|_| {
+                SecretKey::from_slice(&[1u8; 32]).unwrap()
             });
-            let initial_sk = current_sk.clone();
-            
-            // Convert to ProjectivePoint for fast addition
-            let mut current_point = ProjectivePoint::from(current_sk.public_key());
-            
-            // Reuse Keccak hasher
+            let mut current_point = ProjectivePoint::from(initial_sk.public_key());
             let mut hasher = Keccak256::new();
-            
-            // Local counters
+
             let mut local_steps: u64 = 0;
-            const BATCH_SIZE: usize = 2048; // Stable peak amortization without cache thrashing
-            const REPORT_BATCH_SIZE: u64 = 262_144; // Reduced contention (~250k steps)
+            const BATCH_SIZE: usize = 2048;
+            const REPORT_BATCH_SIZE: u64 = 262_144;
 
-            // Keep a single Affine G hot in cache — faster than a kG increment table
             let g_affine = AffinePoint::GENERATOR;
-
-            // Reused across batches to avoid re-zeroing large stack arrays every iteration
             let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
 
             loop {
-                // Batch reporting and check
                 if local_steps % REPORT_BATCH_SIZE == 0 && local_steps > 0 {
                     total_attempts.fetch_add(REPORT_BATCH_SIZE, Ordering::Relaxed);
-                    
                     if found_count.load(Ordering::Acquire) >= args_count {
                         break;
                     }
@@ -539,31 +444,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(feature = "mnemonic")]
                 if args_show_mnemonic {
-                    // Mnemonic path (slow, no batching needed)
                     let mut entropy = [0u8; 16];
                     rng.fill_bytes(&mut entropy);
                     if let Ok(mnemonic) = Mnemonic::from_entropy(&entropy) {
                         if let Ok(wallet) = SimpleWallet::from_mnemonic(&mnemonic) {
-                            let addr_bytes = wallet.address();
-                            if match_prefix_suffix_bytes(&addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
+                            let addr_bytes = wallet.address;
+                            if match_prefix_suffix_bytes(
+                                &addr_bytes,
+                                &start_nybbles,
+                                &end_nybbles,
+                                fast_fail_byte,
+                            ) {
                                 let addr_hex = hex_encode(&addr_bytes);
                                 let private_key_bytes = wallet.to_bytes();
-
                                 let idx = found_count.fetch_add(1, Ordering::AcqRel);
                                 if idx < args_count {
                                     match save_encrypted_wallet(&wallet, &password, &output_dir) {
                                         Ok(path) => {
-                                            println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
-                                            println!("Address:    0x{}", addr_hex);
-                                            println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                            println!("Mnemonic:   {}", mnemonic);
-                                            println!("Saved to:   {}", path);
-                                            println!("---");
-                                            sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
+                                            report_found(
+                                                idx,
+                                                args_count,
+                                                &addr_hex,
+                                                &private_key_bytes,
+                                                &path,
+                                                true,
+                                                Some(&mnemonic.to_string()),
+                                            );
+                                            sender.send(()).ok();
                                         }
                                         Err(e) => eprintln!("Error: {}", e),
                                     }
-                                } else { break; }
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -571,53 +484,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Fast path: P, P+G, P+2G, ... via repeated += G (keeps G in L1)
                 let mut p = current_point;
                 for slot in &mut batch_points {
                     *slot = p;
                     p += g_affine;
                 }
 
-                // Variable-time batch normalize — safe here (vanity search, not secret-dependent)
                 let affine_points =
                     <ProjectivePoint as BatchNormalize<_>>::batch_normalize_vartime(&batch_points);
 
                 for (i, point) in affine_points.iter().enumerate() {
-                    // Direct field-byte coords — skips SEC1 ToEncodedPoint overhead
-                    let x = point.x();
-                    let y = point.y();
-
-                    hasher.update(x);
-                    hasher.update(y);
+                    hasher.update(point.x());
+                    hasher.update(point.y());
                     let hash = hasher.finalize_reset();
                     let addr_bytes = &hash[12..];
-                    
-                    if match_prefix_suffix_bytes(addr_bytes, &start_nybbles, &end_nybbles, fast_fail_byte) {
-                        // Reconstruct private key: sk + offset (offset fits in u64)
+
+                    if match_prefix_suffix_bytes(
+                        addr_bytes,
+                        &start_nybbles,
+                        &end_nybbles,
+                        fast_fail_byte,
+                    ) {
                         let offset = local_steps + i as u64;
-                        let matched_scalar = initial_sk.to_nonzero_scalar().as_ref() + Scalar::from(offset);
+                        let matched_scalar =
+                            initial_sk.to_nonzero_scalar().as_ref() + Scalar::from(offset);
                         let matched_sk = SecretKey::from(
                             NonZeroScalar::new(matched_scalar).expect("matched scalar nonzero"),
                         );
                         let wallet = SimpleWallet::new(matched_sk);
-                        
+
                         let addr_hex = hex_encode(addr_bytes);
                         let private_key_bytes = wallet.to_bytes();
-
                         let idx = found_count.fetch_add(1, Ordering::AcqRel);
                         if idx < args_count {
                             match save_encrypted_wallet(&wallet, &password, &output_dir) {
                                 Ok(path) => {
-                                    println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
-                                    println!("Address:    0x{}", addr_hex);
-                                    if args_show_full_key {
-                                        println!("PrivateKey: {}", hex_encode(&private_key_bytes));
-                                    } else {
-                                        println!("PrivateKey: {}", redact_private_key(&hex_encode(&private_key_bytes)));
-                                    }
-                                    println!("Saved to:   {}", path);
-                                    println!("---");
-                                    sender.send((addr_hex, hex_encode(&private_key_bytes), path)).ok();
+                                    report_found(
+                                        idx,
+                                        args_count,
+                                        &addr_hex,
+                                        &private_key_bytes,
+                                        &path,
+                                        args_show_full_key,
+                                        #[cfg(feature = "mnemonic")]
+                                        None,
+                                    );
+                                    sender.send(()).ok();
                                 }
                                 Err(e) => eprintln!("Error: {}", e),
                             }
@@ -627,24 +539,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // p is already current + BATCH_SIZE*G
                 current_point = p;
                 local_steps += BATCH_SIZE as u64;
             }
-        });
-        handles.push(handle);
+        }));
     }
 
-    // Wait for all threads to complete
+    drop(sender);
     for handle in handles {
         handle.join().unwrap();
     }
 
-    let mut final_results = Vec::new();
-    for _ in 0..args.count {
-        if let Ok((addr, pk_hex, path)) = receiver.recv() {
-            final_results.push((addr, pk_hex, path));
-        }
+    let mut found = 0usize;
+    while receiver.recv().is_ok() {
+        found += 1;
     }
 
     let elapsed = start_time.elapsed();
@@ -652,7 +560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rate = total_attempts as f64 / elapsed.as_secs_f64();
 
     println!("\n=== Summary ===");
-    println!("Generated {} wallet(s) successfully", final_results.len());
+    println!("Generated {} wallet(s) successfully", found);
     println!("Total attempts: {}M", total_attempts / 1_000_000);
     println!("Average rate: {:.0}K attempts/second", rate / 1_000.0);
     if args.count > 1 {
