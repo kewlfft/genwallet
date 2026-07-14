@@ -1,6 +1,7 @@
 #[cfg(feature = "mnemonic")]
 use bip39::Mnemonic;
-use k256::{AffinePoint, NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use k256::{AffinePoint, FieldBytes, NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use k256::elliptic_curve::ff::PrimeField;
 use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
 
 use rand::rngs::StdRng;
@@ -23,6 +24,57 @@ use std::sync::mpsc;
 use std::thread;
 use sha3::{Keccak256, Digest};
 use indicatif::{ProgressBar, ProgressStyle};
+
+/// secp256k1 GLV eigenvalue λ: φ(P) = λ·P = (β·x, y).
+/// Each walked point yields 6 address candidates: ±P, ±φ(P), ±φ²(P).
+const GLV_PER_POINT: u64 = 6;
+
+/// Big-endian λ bytes (cube root of unity in the scalar field).
+const GLV_LAMBDA_BYTES: [u8; 32] = [
+    0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0, 0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
+    0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78, 0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72,
+];
+
+#[inline(always)]
+fn glv_lambda() -> Scalar {
+    Scalar::from_repr(GLV_LAMBDA_BYTES.into()).expect("GLV lambda is a valid scalar")
+}
+
+/// Recover `± λ^power · (base + offset)` from a GLV match.
+/// `which`: bit0 = negate, bits1.. = endomorphism power (0/1/2).
+#[inline(always)]
+fn recover_glv_scalar(base: &Scalar, offset: u64, which: u8) -> Scalar {
+    let mut k = *base + Scalar::from(offset);
+    let power = which >> 1;
+    let lambda = glv_lambda();
+    for _ in 0..power {
+        k *= lambda;
+    }
+    if which & 1 != 0 {
+        k = -k;
+    }
+    k
+}
+
+/// Six (x‖y) pubkey encodings for Ethereum address hashing from one affine point.
+#[inline(always)]
+fn glv_pubkey_coords(point: &AffinePoint) -> [(FieldBytes, FieldBytes, u8); 6] {
+    let x = point.x();
+    let y = point.y();
+    let y_neg = (-*point).y();
+    // endomorphism keeps z=1 when started from affine, so to_affine is cheap.
+    let phi = ProjectivePoint::from(*point).endomorphism();
+    let x_phi = phi.to_affine().x();
+    let x_phi2 = phi.endomorphism().to_affine().x();
+    [
+        (x, y, 0),
+        (x, y_neg, 1),
+        (x_phi, y, 2),
+        (x_phi, y_neg, 3),
+        (x_phi2, y, 4),
+        (x_phi2, y_neg, 5),
+    ]
+}
 
 struct SimpleWallet {
     private_key: SecretKey,
@@ -430,9 +482,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let g_affine = AffinePoint::GENERATOR;
             let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
 
+            #[cfg(feature = "mnemonic")]
+            let addrs_per_step: u64 = if args_show_mnemonic { 1 } else { GLV_PER_POINT };
+            #[cfg(not(feature = "mnemonic"))]
+            let addrs_per_step: u64 = GLV_PER_POINT;
+
             loop {
                 if local_steps % REPORT_BATCH_SIZE == 0 && local_steps > 0 {
-                    total_attempts.fetch_add(REPORT_BATCH_SIZE, Ordering::Relaxed);
+                    total_attempts.fetch_add(REPORT_BATCH_SIZE * addrs_per_step, Ordering::Relaxed);
                     if found_count.load(Ordering::Acquire) >= args_count {
                         break;
                     }
@@ -492,27 +549,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let affine_points =
                     <ProjectivePoint as BatchNormalize<_>>::batch_normalize_vartime(&batch_points);
 
+                let base_scalar = *initial_sk.to_nonzero_scalar().as_ref();
+
                 for (i, point) in affine_points.iter().enumerate() {
-                    hasher.update(point.x());
-                    hasher.update(point.y());
-                    let hash = hasher.finalize_reset();
-                    let addr_bytes = &hash[12..];
+                    for (x, y, which) in glv_pubkey_coords(point) {
+                        hasher.update(x);
+                        hasher.update(y);
+                        let hash = hasher.finalize_reset();
+                        let addr_bytes = &hash[12..];
 
-                    if match_prefix_suffix_bytes(
-                        addr_bytes,
-                        &start_nybbles,
-                        &end_nybbles,
-                        fast_fail_byte,
-                    ) {
+                        if !match_prefix_suffix_bytes(
+                            addr_bytes,
+                            &start_nybbles,
+                            &end_nybbles,
+                            fast_fail_byte,
+                        ) {
+                            continue;
+                        }
+
                         let offset = local_steps + i as u64;
-                        let matched_scalar =
-                            initial_sk.to_nonzero_scalar().as_ref() + Scalar::from(offset);
-                        let matched_sk = SecretKey::from(
-                            NonZeroScalar::new(matched_scalar).expect("matched scalar nonzero"),
-                        );
-                        let wallet = SimpleWallet::new(matched_sk);
+                        let matched_scalar = recover_glv_scalar(&base_scalar, offset, which);
+                        let Some(nz) = Option::<NonZeroScalar>::from(NonZeroScalar::new(matched_scalar))
+                        else {
+                            continue;
+                        };
+                        let wallet = SimpleWallet::new(SecretKey::from(nz));
 
-                        let addr_hex = hex::encode(addr_bytes);
+                        // Guard against a mismatched GLV reconstruction.
+                        if wallet.address.as_slice() != addr_bytes {
+                            pb.suspend(|| {
+                                eprintln!(
+                                    "GLV verify failed (which={which}): hashed 0x{} vs key 0x{}",
+                                    hex::encode(addr_bytes),
+                                    hex::encode(wallet.address)
+                                );
+                            });
+                            continue;
+                        }
+
+                        let addr_hex = hex::encode(wallet.address);
                         let private_key_bytes = wallet.to_bytes();
                         let idx = found_count.fetch_add(1, Ordering::AcqRel);
                         if idx < args_count {
@@ -573,4 +648,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nTotal time: {:.2?}", elapsed);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod glv_tests {
+    use super::*;
+
+    fn addr_from_xy(x: &FieldBytes, y: &FieldBytes) -> [u8; 20] {
+        let mut hasher = Keccak256::new();
+        hasher.update(x);
+        hasher.update(y);
+        let hash = hasher.finalize();
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&hash[12..]);
+        addr
+    }
+
+    #[test]
+    fn glv_recover_matches_all_six_variants() {
+        let base = Scalar::from(0xDEAD_BEEFu64);
+        let offset = 42u64;
+        let k = base + Scalar::from(offset);
+        let point = (ProjectivePoint::GENERATOR * k).to_affine();
+
+        for (x, y, which) in glv_pubkey_coords(&point) {
+            let hashed = addr_from_xy(&x, &y);
+            let recovered = recover_glv_scalar(&base, offset, which);
+            let wallet = SimpleWallet::new(SecretKey::from(
+                NonZeroScalar::new(recovered).expect("nonzero"),
+            ));
+            assert_eq!(
+                wallet.address, hashed,
+                "GLV mismatch for which={which}"
+            );
+        }
+    }
 }
