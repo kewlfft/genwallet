@@ -175,8 +175,6 @@ fn save_encrypted_wallet(
     password: &str,
     output_dir: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    fs::create_dir_all(output_dir)?;
-
     let addr = hex::encode(wallet.address);
     let file_path = Path::new(output_dir).join(format!("{}.json", addr));
     let private_key_bytes = wallet.to_bytes();
@@ -234,35 +232,6 @@ fn save_encrypted_wallet(
     Ok(file_path.display().to_string())
 }
 
-fn report_found(
-    pb: &ProgressBar,
-    idx: usize,
-    count: usize,
-    addr_hex: &str,
-    private_key_bytes: &[u8; 32],
-    path: &str,
-    show_full_key: bool,
-    #[cfg(feature = "mnemonic")] mnemonic: Option<&str>,
-) {
-    // suspend so messages print even when the bar draw target is hidden (non-TTY)
-    pb.suspend(|| {
-        println!("\n🎉 Found wallet {} of {}", idx + 1, count);
-        println!("Address:    0x{}", addr_hex);
-        let pk = hex::encode(private_key_bytes);
-        if show_full_key {
-            println!("PrivateKey: {}", pk);
-        } else {
-            println!("PrivateKey: {}", redact_private_key(&pk));
-        }
-        #[cfg(feature = "mnemonic")]
-        if let Some(m) = mnemonic {
-            println!("Mnemonic:   {}", m);
-        }
-        println!("Saved to:   {}", path);
-        println!("---");
-    });
-}
-
 /// Claim a result slot, encrypt/save, and report. Returns `true` when this worker should stop.
 fn claim_and_save(
     wallet: &SimpleWallet,
@@ -282,17 +251,22 @@ fn claim_and_save(
 
     match save_encrypted_wallet(wallet, password, output_dir) {
         Ok(path) => {
-            report_found(
-                pb,
-                idx,
-                args_count,
-                &hex::encode(wallet.address),
-                &wallet.to_bytes(),
-                &path,
-                show_full_key,
+            pb.suspend(|| {
+                println!("\n🎉 Found wallet {} of {}", idx + 1, args_count);
+                println!("Address:    0x{}", hex::encode(wallet.address));
+                let pk = hex::encode(wallet.to_bytes());
+                if show_full_key {
+                    println!("PrivateKey: {}", pk);
+                } else {
+                    println!("PrivateKey: {}", redact_private_key(&pk));
+                }
                 #[cfg(feature = "mnemonic")]
-                mnemonic,
-            );
+                if let Some(m) = mnemonic {
+                    println!("Mnemonic:   {}", m);
+                }
+                println!("Saved to:   {}", path);
+                println!("---");
+            });
             saved_count.fetch_add(1, Ordering::Relaxed);
             false
         }
@@ -395,6 +369,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.start_pattern.len() > 40 || args.end_pattern.len() > 40 {
         return Err("Pattern length cannot exceed 40 characters".into());
     }
+
+    fs::create_dir_all(&output_dir)?;
 
     let pattern_start = args.start_pattern.to_lowercase();
     let pattern_end = args.end_pattern.to_lowercase();
@@ -602,7 +578,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let wallet = SimpleWallet::new(SecretKey::from(nz));
 
-                        // Guard against a mismatched GLV reconstruction.
+                        // Guard against a mismatched GLV reconstruction (debug builds only).
+                        #[cfg(debug_assertions)]
                         if wallet.address.as_slice() != addr_bytes {
                             pb.suspend(|| {
                                 eprintln!(
