@@ -5,6 +5,7 @@ use k256::elliptic_curve::ff::PrimeField;
 use k256::elliptic_curve::hazmat::FieldArithmetic;
 use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
 
+use rand::distr::{Alphanumeric, SampleString};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 #[cfg(feature = "mnemonic")]
@@ -21,7 +22,6 @@ use clap::Parser;
 use std::fs;
 use std::path::Path;
 use rpassword::prompt_password;
-use std::sync::mpsc;
 use std::thread;
 use sha3::{Keccak256, Digest};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -263,27 +263,55 @@ fn report_found(
     });
 }
 
+/// Claim a result slot, encrypt/save, and report. Returns `true` when this worker should stop.
+fn claim_and_save(
+    wallet: &SimpleWallet,
+    password: &str,
+    output_dir: &str,
+    pb: &ProgressBar,
+    found_count: &AtomicUsize,
+    saved_count: &AtomicUsize,
+    args_count: usize,
+    show_full_key: bool,
+    #[cfg(feature = "mnemonic")] mnemonic: Option<&str>,
+) -> bool {
+    let idx = found_count.fetch_add(1, Ordering::AcqRel);
+    if idx >= args_count {
+        return true;
+    }
+
+    match save_encrypted_wallet(wallet, password, output_dir) {
+        Ok(path) => {
+            report_found(
+                pb,
+                idx,
+                args_count,
+                &hex::encode(wallet.address),
+                &wallet.to_bytes(),
+                &path,
+                show_full_key,
+                #[cfg(feature = "mnemonic")]
+                mnemonic,
+            );
+            saved_count.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+        Err(e) => {
+            pb.suspend(|| eprintln!("Error: {}", e));
+            false
+        }
+    }
+}
+
 fn hex_to_nybbles(hex_str: &str) -> Vec<u8> {
     hex_str
         .bytes()
         .map(|byte| match byte {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
             _ => 0,
         })
         .collect()
-}
-
-fn generate_random_password(len: usize) -> String {
-    const CHARSET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
-    let password: Vec<u8> = (0..len)
-        .map(|_| CHARSET[(rng.next_u32() as usize) % CHARSET.len()])
-        .collect();
-    // SAFETY: CHARSET is ASCII
-    unsafe { String::from_utf8_unchecked(password) }
 }
 
 #[inline(always)]
@@ -393,7 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if args.ask_password {
         prompt_password("Enter password to encrypt wallets: ")?
     } else {
-        let random_password = generate_random_password(16);
+        let random_password = Alphanumeric.sample_string(&mut rand::rng(), 16);
         println!("Generated random password: {}", random_password);
         random_password
     };
@@ -404,8 +432,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let found_count = Arc::new(AtomicUsize::new(0));
+    let saved_count = Arc::new(AtomicUsize::new(0));
     let total_attempts = Arc::new(AtomicU64::new(0));
-    let (sender, receiver) = mpsc::channel();
     let start_time = Instant::now();
 
     let estimate = (pattern_difficulty * args.count as f64).ceil().max(1.0) as u64;
@@ -422,8 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .with_key("eta", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
             write!(w, "{}", format_eta(state.eta().as_secs_f64())).unwrap()
-        })
-        .progress_chars("##-"),
+        }),
     );
     pb.set_message(format!("0/{}", args.count));
 
@@ -465,9 +492,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut seed = [0u8; 32];
         master_rng.fill_bytes(&mut seed);
 
-        let sender = sender.clone();
         let total_attempts = total_attempts.clone();
         let found_count = found_count.clone();
+        let saved_count = saved_count.clone();
         let start_nybbles = start_nybbles.clone();
         let end_nybbles = end_nybbles.clone();
         let args_count = args.count;
@@ -518,38 +545,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     rng.fill_bytes(&mut entropy);
                     if let Ok(mnemonic) = Mnemonic::from_entropy(&entropy) {
                         if let Ok(wallet) = SimpleWallet::from_mnemonic(&mnemonic) {
-                            let addr_bytes = wallet.address;
                             if match_prefix_suffix_bytes(
-                                &addr_bytes,
+                                &wallet.address,
                                 &start_nybbles,
                                 &end_nybbles,
                                 fast_fail_byte,
+                            ) && claim_and_save(
+                                &wallet,
+                                &password,
+                                &output_dir,
+                                &pb,
+                                &found_count,
+                                &saved_count,
+                                args_count,
+                                true,
+                                Some(&mnemonic.to_string()),
                             ) {
-                                let addr_hex = hex::encode(addr_bytes);
-                                let private_key_bytes = wallet.to_bytes();
-                                let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                                if idx < args_count {
-                                    match save_encrypted_wallet(&wallet, &password, &output_dir) {
-                                        Ok(path) => {
-                                            report_found(
-                                                &pb,
-                                                idx,
-                                                args_count,
-                                                &addr_hex,
-                                                &private_key_bytes,
-                                                &path,
-                                                true,
-                                                Some(&mnemonic.to_string()),
-                                            );
-                                            sender.send(()).ok();
-                                        }
-                                        Err(e) => {
-                                            pb.suspend(|| eprintln!("Error: {}", e));
-                                        }
-                                    }
-                                } else {
-                                    break;
-                                }
+                                break;
                             }
                         }
                     }
@@ -602,30 +614,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        let addr_hex = hex::encode(wallet.address);
-                        let private_key_bytes = wallet.to_bytes();
-                        let idx = found_count.fetch_add(1, Ordering::AcqRel);
-                        if idx < args_count {
-                            match save_encrypted_wallet(&wallet, &password, &output_dir) {
-                                Ok(path) => {
-                                    report_found(
-                                        &pb,
-                                        idx,
-                                        args_count,
-                                        &addr_hex,
-                                        &private_key_bytes,
-                                        &path,
-                                        args_show_full_key,
-                                        #[cfg(feature = "mnemonic")]
-                                        None,
-                                    );
-                                    sender.send(()).ok();
-                                }
-                                Err(e) => {
-                                    pb.suspend(|| eprintln!("Error: {}", e));
-                                }
-                            }
-                        } else {
+                        if claim_and_save(
+                            &wallet,
+                            &password,
+                            &output_dir,
+                            &pb,
+                            &found_count,
+                            &saved_count,
+                            args_count,
+                            args_show_full_key,
+                            #[cfg(feature = "mnemonic")]
+                            None,
+                        ) {
                             return;
                         }
                     }
@@ -637,20 +637,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    drop(sender);
     for handle in handles {
         handle.join().unwrap();
-    }
-
-    let mut found = 0usize;
-    while receiver.recv().is_ok() {
-        found += 1;
     }
 
     pb.finish_and_clear();
 
     let elapsed = start_time.elapsed();
     let total_attempts = total_attempts.load(Ordering::Relaxed);
+    let found = saved_count.load(Ordering::Relaxed);
     let rate = total_attempts as f64 / elapsed.as_secs_f64();
 
     println!("\n=== Summary ===");
