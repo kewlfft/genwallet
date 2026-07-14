@@ -1,7 +1,8 @@
 #[cfg(feature = "mnemonic")]
 use bip39::Mnemonic;
-use k256::{AffinePoint, FieldBytes, NonZeroScalar, ProjectivePoint, Scalar, SecretKey};
+use k256::{AffinePoint, FieldBytes, NonZeroScalar, ProjectivePoint, Scalar, Secp256k1, SecretKey};
 use k256::elliptic_curve::ff::PrimeField;
+use k256::elliptic_curve::hazmat::FieldArithmetic;
 use k256::elliptic_curve::point::{AffineCoordinates, BatchNormalize};
 
 use rand::rngs::StdRng;
@@ -14,7 +15,7 @@ use ctr::Ctr32BE;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use clap::Parser;
 use std::fs;
@@ -29,16 +30,27 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// Each walked point yields 6 address candidates: ±P, ±φ(P), ±φ²(P).
 const GLV_PER_POINT: u64 = 6;
 
+type FieldElement = <Secp256k1 as FieldArithmetic>::FieldElement;
+
 /// Big-endian λ bytes (cube root of unity in the scalar field).
 const GLV_LAMBDA_BYTES: [u8; 32] = [
     0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0, 0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
     0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78, 0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72,
 ];
 
-#[inline(always)]
-fn glv_lambda() -> Scalar {
+/// β in F_p — cube root of unity so φ(x, y) = (β·x, y).
+const GLV_BETA_BYTES: [u8; 32] = [
+    0x7a, 0xe9, 0x6a, 0x2b, 0x65, 0x7c, 0x07, 0x10, 0x6e, 0x64, 0x47, 0x9e, 0xac, 0x34, 0x34, 0xe9,
+    0x9c, 0xf0, 0x49, 0x75, 0x12, 0xf5, 0x89, 0x95, 0xc1, 0x39, 0x6c, 0x28, 0x71, 0x95, 0x01, 0xee,
+];
+
+static GLV_LAMBDA: LazyLock<Scalar> = LazyLock::new(|| {
     Scalar::from_repr(GLV_LAMBDA_BYTES.into()).expect("GLV lambda is a valid scalar")
-}
+});
+
+static GLV_BETA: LazyLock<FieldElement> = LazyLock::new(|| {
+    FieldElement::from_repr(GLV_BETA_BYTES.into()).expect("GLV beta is a valid field element")
+});
 
 /// Recover `± λ^power · (base + offset)` from a GLV match.
 /// `which`: bit0 = negate, bits1.. = endomorphism power (0/1/2).
@@ -46,9 +58,8 @@ fn glv_lambda() -> Scalar {
 fn recover_glv_scalar(base: &Scalar, offset: u64, which: u8) -> Scalar {
     let mut k = *base + Scalar::from(offset);
     let power = which >> 1;
-    let lambda = glv_lambda();
     for _ in 0..power {
-        k *= lambda;
+        k *= *GLV_LAMBDA;
     }
     if which & 1 != 0 {
         k = -k;
@@ -56,16 +67,20 @@ fn recover_glv_scalar(base: &Scalar, offset: u64, which: u8) -> Scalar {
     k
 }
 
-/// Six (x‖y) pubkey encodings for Ethereum address hashing from one affine point.
+/// Six (x‖y) pubkey encodings: ±P, ±φ(P), ±φ²(P) via β·x (no field inversion).
 #[inline(always)]
-fn glv_pubkey_coords(point: &AffinePoint) -> [(FieldBytes, FieldBytes, u8); 6] {
-    let x = point.x();
-    let y = point.y();
-    let y_neg = (-*point).y();
-    // endomorphism keeps z=1 when started from affine, so to_affine is cheap.
-    let phi = ProjectivePoint::from(*point).endomorphism();
-    let x_phi = phi.to_affine().x();
-    let x_phi2 = phi.endomorphism().to_affine().x();
+fn glv_pubkey_coords(
+    point: &AffinePoint,
+    beta: &FieldElement,
+) -> [(FieldBytes, FieldBytes, u8); 6] {
+    let x = FieldElement::from_repr(point.x()).expect("affine x in field");
+    let y = FieldElement::from_repr(point.y()).expect("affine y in field");
+    let y_neg = (-y).to_repr();
+    let y = y.to_repr();
+    let x_phi = x * beta;
+    let x_phi2 = (x_phi * beta).to_repr();
+    let x_phi = x_phi.to_repr();
+    let x = x.to_repr();
     [
         (x, y, 0),
         (x, y_neg, 1),
@@ -550,9 +565,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     <ProjectivePoint as BatchNormalize<_>>::batch_normalize_vartime(&batch_points);
 
                 let base_scalar = *initial_sk.to_nonzero_scalar().as_ref();
+                let beta = *GLV_BETA;
 
                 for (i, point) in affine_points.iter().enumerate() {
-                    for (x, y, which) in glv_pubkey_coords(point) {
+                    for (x, y, which) in glv_pubkey_coords(point, &beta) {
                         hasher.update(x);
                         hasher.update(y);
                         let hash = hasher.finalize_reset();
@@ -671,7 +687,7 @@ mod glv_tests {
         let k = base + Scalar::from(offset);
         let point = (ProjectivePoint::GENERATOR * k).to_affine();
 
-        for (x, y, which) in glv_pubkey_coords(&point) {
+        for (x, y, which) in glv_pubkey_coords(&point, &GLV_BETA) {
             let hashed = addr_from_xy(&x, &y);
             let recovered = recover_glv_scalar(&base, offset, which);
             let wallet = SimpleWallet::new(SecretKey::from(
