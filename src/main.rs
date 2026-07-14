@@ -73,14 +73,14 @@ fn glv_pubkey_coords(
     point: &AffinePoint,
     beta: &FieldElement,
 ) -> [(FieldBytes, FieldBytes, u8); 6] {
-    let x = FieldElement::from_repr(point.x()).expect("affine x in field");
-    let y = FieldElement::from_repr(point.y()).expect("affine y in field");
-    let y_neg = (-y).to_repr();
-    let y = y.to_repr();
-    let x_phi = x * beta;
+    let x = point.x();
+    let y = point.y();
+    let y_fe = FieldElement::from_repr(y).expect("affine y in field");
+    let y_neg = (-y_fe).to_repr();
+    let x_fe = FieldElement::from_repr(x).expect("affine x in field");
+    let x_phi = x_fe * beta;
     let x_phi2 = (x_phi * beta).to_repr();
     let x_phi = x_phi.to_repr();
-    let x = x.to_repr();
     [
         (x, y, 0),
         (x, y_neg, 1),
@@ -496,6 +496,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let g_affine = AffinePoint::GENERATOR;
             let mut batch_points = [ProjectivePoint::IDENTITY; BATCH_SIZE];
+            let base_scalar = *initial_sk.to_nonzero_scalar().as_ref();
+            let beta = *GLV_BETA;
 
             #[cfg(feature = "mnemonic")]
             let addrs_per_step: u64 = if args_show_mnemonic { 1 } else { GLV_PER_POINT };
@@ -563,9 +565,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let affine_points =
                     <ProjectivePoint as BatchNormalize<_>>::batch_normalize_vartime(&batch_points);
-
-                let base_scalar = *initial_sk.to_nonzero_scalar().as_ref();
-                let beta = *GLV_BETA;
 
                 for (i, point) in affine_points.iter().enumerate() {
                     for (x, y, which) in glv_pubkey_coords(point, &beta) {
